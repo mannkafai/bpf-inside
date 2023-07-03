@@ -579,6 +579,11 @@ int bpf_object__load_skeleton(struct bpf_object_skeleton *s)
             --> bpf_object__probe_loading(obj);
                 --> bump_rlimit_memlock();
                 --> bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, NULL, "GPL", insns, insn_cnt, NULL)
+                    --> bump_rlimit_memlock();
+                    --> fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
+                        --> fd = sys_bpf_fd(BPF_PROG_LOAD, attr, size);
+                            --> fd = sys_bpf(cmd, attr, size);
+                                --> syscall(__NR_bpf, cmd, attr, size);
                 --> bpf_prog_load(BPF_PROG_TYPE_TRACEPOINT, NULL, "GPL", insns, insn_cnt, NULL);
             --> bpf_object__load_vmlinux_btf(obj, false);
                 --> obj->btf_vmlinux = btf__load_vmlinux_btf();
@@ -598,14 +603,28 @@ int bpf_object__load_skeleton(struct bpf_object_skeleton *s)
                     --> find_struct_ops_kern_types(kern_btf, tname, ...);
             --> bpf_object__create_maps(obj);
                 --> map_set_def_max_entries(map);
+                --> bpf_object__reuse_map(map); //if (map->pin_path) 
+                    --> pin_fd = bpf_obj_get(map->pin_path);
+                        --> bpf_obj_get_opts(pathname, NULL);
+                            --> fd = sys_bpf_fd(BPF_OBJ_GET, &attr, attr_sz);
+                    --> bpf_map__reuse_fd(map, pin_fd);
+                        --> bpf_map_get_info_by_fd(fd, &info, &len);
+                            --> bpf_obj_get_info_by_fd(map_fd, info, info_len);
+                                --> sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &attr, attr_sz);
                 --> bpf_object__create_map(obj, map, false);
                     --> map->fd = bpf_map_create(def->type, map_name, def->key_size, def->value_size, ...);
+                        --> bump_rlimit_memlock();
+                        --> fd = sys_bpf_fd(BPF_MAP_CREATE, &attr, attr_sz);
                 --> bpf_object__populate_internal_map(obj, map); //bpf_map__is_internal(map)
                     --> bpf_map_update_elem(map->fd, &zero, map->mmaped, 0);
+                        --> sys_bpf(BPF_MAP_UPDATE_ELEM, &attr, attr_sz);
                     --> bpf_map_freeze(map->fd); //Freeze .rodata and .kconfig map as read-only from syscall side
+                        --> sys_bpf(BPF_MAP_FREEZE, &attr, attr_sz);
                 --> init_map_in_map_slots(obj, map);
+                    --> bpf_map_update_elem(map->fd, &i, &fd, 0);
                 --> bpf_map__pin(map, NULL);
-                    --> bpf_obj_pin(map->fd, map->pin_path)
+                    --> bpf_obj_pin(map->fd, map->pin_path);
+                        --> sys_bpf(BPF_OBJ_PIN, &attr, attr_sz);
             --> bpf_object__relocate(obj, obj->btf_custom_path ? : target_btf_path);
                 --> bpf_object__relocate_core(obj, targ_btf_path);
                 --> bpf_object__sort_relos(obj);
@@ -752,7 +771,7 @@ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
         --> bpf_link__destroy(*link);
             --> link->detach(link);
             --> free(link->pin_path);
-            --> link->dealloc(link); / free(link);
+            --> link->dealloc(link); // or free(link);
     --> bpf_object__close(*s->obj);
         --> usdt_manager_free(obj->usdt_man);
         --> bpf_gen__free(obj->gen_loader);
@@ -780,7 +799,7 @@ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
 
 本文借助`minimal`示例分析了使用libbpf开发BPF程序的过程，分析了libbpf管理BPF程序生命周期的全过程。我们在使用libbpf开发时，一般只需要关注BPF程序的`SEC`定义即可。借助libbpf我们可以很快速的开发BPF程序。
 
-## 引用
+## 参考资料
 
 [libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap)
 [libbpf_overview](https://libbpf.readthedocs.io/en/latest/libbpf_overview.html)
