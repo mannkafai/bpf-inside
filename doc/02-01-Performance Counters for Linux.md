@@ -1,4 +1,4 @@
-# Linux性能计数器（PCL）在内核的实现（第一部分）
+# Linux性能计数器在内核的实现
 
 ## 0 前言
 
@@ -941,6 +941,10 @@ $ tree /sys/bus/event_source/
 
 19 directories, 3 files
 ```
+
+## 6 perf事件用户内存映射
+
+略。
 
 ## 参考资料
 
