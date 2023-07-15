@@ -206,20 +206,28 @@ group_fd > 0 : 加入到之前创建的group leader中；
 
 ```C
 SYSCALL_DEFINE5(perf_event_open, ..)
+    // 权限检查
     --> err = security_perf_event_open(&attr, PERF_SECURITY_OPEN);
+    // 获取fd
     --> event_fd = get_unused_fd_flags(f_flags);
+    // 获取group
     --> err = perf_fget_light(group_fd, &group);
+    // 获取pid对应的task
     --> task = find_lively_task_by_vpid(pid);
+    // 分配事件
     --> event = perf_event_alloc(&attr, cpu, task, group_leader, NULL, NULL, NULL, cgroup_fd);
         --> event = kmem_cache_alloc_node(perf_event_cache, GFP_KERNEL | __GFP_ZERO, node);
         --> init_irq_work(&event->pending_irq, perf_pending_irq);
         --> init_task_work(&event->pending_task, perf_pending_task);
         --> event->hw.target = get_task_struct(task);
+        // 溢出事件处理函数
         --> event->overflow_handler = perf_event_output_forward;
         --> pmu = perf_init_event(event);
+            //获取pmu
             --> pmu = idr_find(&pmu_idr, type); // or pmus
             --> ret = perf_try_init_event(pmu, event);
                 --> event->pmu = pmu;
+                // 事件初始化
                 --> ret = pmu->event_init(event);
         --> err = perf_cgroup_connect(cgroup_fd, event, attr, group_leader);
         --> err = exclusive_event_init(event);
@@ -228,9 +236,11 @@ SYSCALL_DEFINE5(perf_event_open, ..)
         --> !task // CPU维度
             --> cpuctx = per_cpu_ptr(&perf_cpu_context, event->cpu);
             --> ctx = &cpuctx->ctx;
-        --> task != null
+        --> task != null // task维度
+            // 使用task->perf_event_ctxp
             --> ctx = perf_lock_task_context(task, &flags);
                 --> ctx = rcu_dereference(task->perf_event_ctxp);
+            // 不存在时分配
             --> !ctx
                 --> ctx = alloc_perf_context(task); 
                     --> ctx = kzalloc(sizeof(struct perf_event_context), GFP_KERNEL);
@@ -239,27 +249,37 @@ SYSCALL_DEFINE5(perf_event_open, ..)
         --> !ctx->task // CPU维度
             --> cpc = per_cpu_ptr(pmu->cpu_pmu_context, event->cpu);
 		    --> epc = &cpc->epc;
+            // 第一次使用时添加到上下文列表中
             --> list_add(&epc->pmu_ctx_entry, &ctx->pmu_ctx_list); //first add
+        // task维度，分配新的
         --> new = kzalloc(sizeof(*epc), GFP_KERNEL); 
         --> list_add(&epc->pmu_ctx_entry, &ctx->pmu_ctx_list); //epc = new
 	    --> epc->ctx = ctx;
     --> event->pmu_ctx = pmu_ctx;
+    // 指定输出时，设置输出事件
     --> err = perf_event_set_output(event, output_event);  // output_event not null
         --> rb = ring_buffer_get(output_event);
         --> ring_buffer_attach(event, rb);
+    // 验证事件占用大小，总量16KiB
     --> perf_event_validate_size(event);
         --> __perf_event_read_size(event, event->group_leader->nr_siblings + 1);
         --> __perf_event_header_size(event, event->attr.sample_type & ~PERF_SAMPLE_READ);
         --> perf_event__id_header_size(event);
         --> event->read_size + event->header_size + event->id_header_size + 
             sizeof(struct perf_event_header) >= 16*1024
+    // 获取辅助事件
     --> perf_get_aux_event(event, group_leader);
+    // 关联性检查，整个组中pmu类型一致
     --> exclusive_event_installable(event, ctx);
         --> exclusive_event_match(iter_event, event);
+    // 获取file
     --> event_file = anon_inode_getfile("[perf_event]", &perf_fops, event, f_flags);
+    // 必要时迁移组
     --> move_group
+    // 计算事件大小
     --> perf_event__header_size(event);
     --> perf_event__id_header_size(event);
+    // 安装事件到ctx
     --> perf_install_in_context(ctx, event, event->cpu);
         --> add_event_to_ctx(event, ctx);
             --> list_add_event(event, ctx);
@@ -267,6 +287,7 @@ SYSCALL_DEFINE5(perf_event_open, ..)
             --> perf_group_attach(event);
                 --> list_add_tail(&event->sibling_list, &group_leader->sibling_list);
     --> list_add_tail(&event->owner_entry, &current->perf_event_list);
+    // fd关联文件
     --> fd_install(event_fd, event_file);
         --> rcu_assign_pointer(fdt->fd[fd], file);
 ```
@@ -373,9 +394,11 @@ schedule()
         --> rq = context_switch(rq, prev, next, &rf);
             --> prepare_task_switch(rq, prev, next);
                 --> perf_event_task_sched_out(prev, next);
+                    // 软件事件调度（切出事件）
                     --> __perf_sw_event_sched(PERF_COUNT_SW_CONTEXT_SWITCHES, 1, 0);
                     --> __perf_sw_event_sched(PERF_COUNT_SW_CGROUP_SWITCHES, 1, 0);
                     --> __perf_event_task_sched_out(prev, next);
+                        // PMU上下文切换（切出事件）
                         --> perf_pmu_sched_task(task, next, false); // perf_sched_cb_usages > 0
                             --> __perf_pmu_sched_task(cpc, sched_in); //sched_cb_list
                                 --> perf_pmu_disable(pmu);
@@ -383,8 +406,10 @@ schedule()
                                 --> pmu->sched_task(cpc->task_epc, sched_in);
                                 --> perf_pmu_enable(pmu);
                                     --> pmu->pmu_enable(pmu);
+                        // event切换事件（切出事件）
                         --> perf_event_switch(task, next, false); // nr_switch_events > 0
                             --> perf_iterate_sb(perf_event_switch_output, &switch_event, NULL);
+                                // task_ctx 切换事件
                                 --> perf_iterate_ctx(task_ctx, output, data, false); // task_ctx 
                                     --> output(event, data); //perf_event_switch_output  ctx->event_list 
                                         --> perf_event_header__init_id(&se->event_id.header, &sample, event);
@@ -392,17 +417,25 @@ schedule()
                                         --> perf_output_put(&handle, se->event_id.header);
                                         --> perf_event__output_id_sample(event, &handle, &sample);
                                         --> perf_output_end(&handle);
+                                // 当前CPU切换事件
                                 --> perf_iterate_sb_cpu(output, data); // this_cpu_ptr(&pmu_sb_events)->list
                                     --> output(event, data); // perf_event_switch_output 
+                                // 当前task切换事件
                                 --> perf_iterate_ctx(ctx, output, data, false); // current->perf_event_ctxp
+                        // event上下文切出，任务维度
                         --> perf_event_context_sched_out(task, next);
+                            // 禁用 task->perf_event_ctxp
                             --> perf_ctx_disable(ctx);
                                 --> perf_pmu_disable(pmu_ctx->pmu); //ctx->pmu_ctx_list
+                            // 切换任务
                             --> perf_ctx_sched_task_cb(ctx, false);
                                 --> pmu_ctx->pmu->sched_task(pmu_ctx, sched_in);
+                            // task，next 的ctx相同或ctx->parent相同时
                             --> perf_event_swap_task_ctx_data(ctx, next_ctx); // same ctx or same parent
                                 --> prev_epc->pmu->swap_task_ctx(prev_epc, next_epc);
+                            // task, next 的ctx不同事件
                             --> task_ctx_sched_out(ctx, EVENT_ALL); // different ctx
+                                // ctx切出
                                 --> ctx_sched_out(ctx, event_type);
                                     --> __pmu_ctx_sched_out(pmu_ctx, is_active);
                                         --> perf_pmu_disable(pmu);
@@ -415,24 +448,34 @@ schedule()
                                             --> event_sched_out(event, ctx); //sibling_list
                                         --> group_sched_out(event, ctx); //pmu_ctx->flexible_active
                                         --> perf_pmu_enable(pmu);
+                            // 启用 task->perf_event_ctxp
                             --> perf_ctx_enable(ctx);
                                 --> perf_pmu_enable(pmu_ctx->pmu); //ctx->pmu_ctx_list
+                        // cgroup上下文切换
                         --> perf_cgroup_switch(next);
                             --> cgrp = perf_cgroup_from_task(task, NULL);
+                            // 禁用 this_cpu_ptr(&perf_cpu_context)
                             --> perf_ctx_disable(&cpuctx->ctx);
+                            // ctx切出
                             --> ctx_sched_out(&cpuctx->ctx, EVENT_ALL);
                             --> cpuctx->cgrp = cgrp;
+                            // ctx切入
                             --> ctx_sched_in(&cpuctx->ctx, EVENT_ALL);
+                            // 启用ctx
                             --> perf_ctx_enable(&cpuctx->ctx);
+            // 切换任务
             --> switch_to(prev, next, prev);
             --> finish_task_switch(prev);
                 --> perf_event_task_sched_in(prev, current);
                     --> __perf_event_task_sched_in(prev, task);
+                        // event上下文切入, 任务维度
                         --> perf_event_context_sched_in(task);
                             --> perf_ctx_disable(ctx);
                             --> perf_ctx_disable(&cpuctx->ctx);
+                            // CPU维度，FLEXIBLE事件切出
                             --> ctx_sched_out(&cpuctx->ctx, EVENT_FLEXIBLE);
                             --> perf_event_sched_in(cpuctx, ctx);
+                                // CPU维度，PINNED事件切入
                                 --> ctx_sched_in(&cpuctx->ctx, EVENT_PINNED);
                                     --> ctx_pinned_sched_in(ctx, NULL);
                                         --> visit_groups_merge(ctx, &ctx->pinned_groups, ...);
@@ -455,14 +498,21 @@ schedule()
                                                 --> group_update_userpage(event);
                                     --> ctx_flexible_sched_in(ctx, NULL);
                                         --> visit_groups_merge(ctx, &ctx->flexible_groups, ...);
+                                // task维度，PINNED事件切入
                                 --> ctx_sched_in(ctx, EVENT_PINNED);
+                                // CPU维度，FLEXIBLE事件切入
                                 --> ctx_sched_in(&cpuctx->ctx, EVENT_FLEXIBLE);
+                                // task维度，FLEXIBLE事件切入
                                 --> ctx_sched_in(ctx, EVENT_FLEXIBLE);
+                            // 切换任务
                             --> perf_ctx_sched_task_cb(cpuctx->task_ctx, true);
                             --> perf_ctx_enable(&cpuctx->ctx);
                             --> perf_ctx_enable(ctx);
+                        // event切换事件（切入事件）
                         --> perf_event_switch(task, prev, true);
+                        // PMU上下文切换（切入事件）
                         --> perf_pmu_sched_task(prev, task, true);
+                    // 软件事件调度（切入事件）
                     --> __perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
 ```
 
@@ -507,7 +557,7 @@ schedule()
   
 在软件事件开启的情况下，进行 `PERF_COUNT_SW_CPU_MIGRATIONS` 事件处理。
 
-## 4 perf事件的ioctl控制
+## 4 perf事件的操作接口
 
 在创建perf_file时，设置了文件的 `ops` 接口，如下：
 
@@ -523,6 +573,8 @@ static const struct file_operations perf_fops = {
 	.fasync			= perf_fasync,
 };
 ```
+
+### 4.1 ioctl控制接口 -- `perf_ioctl`
 
 我们可以通过 `ioctl` 系统调用实现对perf事件的控制，可控制的操作如下：
 
@@ -541,7 +593,7 @@ static const struct file_operations perf_fops = {
 #define PERF_EVENT_IOC_MODIFY_ATTRIBUTES	_IOW('$', 11, struct perf_event_attr *)
 ```
 
-可以看到支持的功能比较丰富，我们只关注其中的 `ENABLE`, `DISABLE`, `RESET`, `REFRESH`, `SET_BPF` 这几个操作。
+可以看到支持的功能比较丰富，对应的功能如下：
 
 * PERF_EVENT_IOC_ENABLE
 
@@ -575,16 +627,21 @@ static void _perf_event_enable(struct perf_event *event)
 
 static void __perf_event_enable(struct perf_event *event, struct perf_cpu_context *cpuctx,
                 struct perf_event_context *ctx, void *info)
+    // ctx启用时，更新时间信息
     -->	ctx_sched_out(ctx, EVENT_TIME); // if (ctx->is_active)
     --> perf_event_set_state(event, PERF_EVENT_STATE_INACTIVE);
     --> perf_cgroup_event_enable(event, ctx);
         --> cpuctx->cgrp = perf_cgroup_from_task(current, ctx);
+    // 更新ctx->task
     --> ctx_sched_in(ctx, EVENT_TIME); 
     --> ctx_resched(cpuctx, task_ctx, get_event_type(event));
         --> perf_ctx_disable(&cpuctx->ctx);
         --> perf_ctx_disable(task_ctx);
+        // task维度切出
         --> task_ctx_sched_out(task_ctx, event_type);
-        --> ctx_sched_out(&cpuctx->ctx, event_type); // ctx_sched_out(&cpuctx->ctx, EVENT_FLEXIBLE);
+        // CPU维度切出
+        --> ctx_sched_out(&cpuctx->ctx, event_type);
+        // CPU维度，task维度 切入
         --> perf_event_sched_in(cpuctx, task_ctx);
         --> perf_ctx_enable(&cpuctx->ctx);
         --> perf_ctx_enable(task_ctx);
@@ -616,7 +673,9 @@ static void _perf_event_disable(struct perf_event *event)
 static void __perf_event_disable(struct perf_event *event, struct perf_cpu_context *cpuctx,
                 struct perf_event_context *ctx, void *info)
     -->	perf_pmu_disable(event->pmu_ctx->pmu);
+    // 该事件是组长时，切出整个组
     --> group_sched_out(event, ctx); // if (event == event->group_leader)
+    // 否则，切出该事件
     --> event_sched_out(event, ctx); // if (event != event->group_leader)
     --> perf_event_set_state(event, PERF_EVENT_STATE_OFF);
     --> perf_cgroup_event_disable(event, ctx);
@@ -645,18 +704,10 @@ static void __perf_event_disable(struct perf_event *event, struct perf_cpu_conte
 
 ```C
 static void _perf_event_reset(struct perf_event *event)
+    // 读取事件
     --> (void)perf_event_read(event, false);
-        --> smp_call_function_single(event_cpu, __perf_event_read, &data, 1); // PERF_EVENT_STATE_ACTIVE
-            --> __perf_event_read(void* info)
-                --> if !data->group
-                    --> pmu->read(event); // !data->group
-                --> else
-                    --> pmu->start_txn(pmu, PERF_PMU_TXN_READ); //read group
-                    --> pmu->read(event);
-                    --> sub->pmu->read(sub);
-                    --> data->ret = pmu->commit_txn(pmu);
-        --> perf_event_update_time(event); // PERF_EVENT_STATE_INACTIVE
     --> local64_set(&event->count, 0);
+    // 更新用户页信息
     --> perf_event_update_userpage(event);
         --> calc_timer_values(event, &now, &enabled, &running);
         --> userpg = rb->user_page;
@@ -747,11 +798,13 @@ static void __perf_event_period(struct perf_event *event, struct perf_cpu_contex
 
 ```C
 int perf_event_set_bpf_prog(struct perf_event *event, struct bpf_prog *prog, u64 bpf_cookie)
+    // 非追踪事件
     --> perf_event_set_bpf_handler(event, prog, bpf_cookie); //!perf_event_is_tracing(event)
         --> event->prog = prog;
         --> event->bpf_cookie = bpf_cookie;
         --> event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
         --> WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
+    // 追踪事件
     --> perf_event_attach_bpf_prog(event, prog, bpf_cookie); // perf_event_is_tracing(event)
         --> bpf_prog_array_copy(old_array, NULL, prog, bpf_cookie, &new_array);
         --> event->prog = prog;
@@ -760,6 +813,130 @@ int perf_event_set_bpf_prog(struct perf_event *event, struct bpf_prog *prog, u64
 ```
 
 当perf_event是追踪事件时，将bpf程序添加到prog数组中；否则，设置event有关bpf相关的属性（ `prog`, `bpf_cookie`, `orig_overflow_handler` ），修改 `overflow_handler` 为 `bpf_overflow_handler`。
+
+### 4.2 读取接口 -- perf_read
+
+`perf_read` 函数读取事件状态，实现过程如下：
+
+```C
+static ssize_t perf_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+    --> security_perf_event_read(event);
+    --> __perf_read(event, buf, count);
+        // 读取整个组事件
+        --> perf_read_group(event, read_format, buf); // if (read_format & PERF_FORMAT_GROUP)
+            --> values = kzalloc(event->read_size, GFP_KERNEL);
+            --> values[0] = 1 + leader->nr_siblings;
+            --> __perf_read_group_add(leader, read_format, values);
+                --> perf_event_read(leader, true);
+                    // PERF_EVENT_STATE_ACTIVE
+                    --> smp_call_function_single(event_cpu, __perf_event_read, &data, 1);  
+                        --> __perf_event_read(void* info)
+                            --> if !data->group
+                                --> pmu->read(event); // !data->group
+                            --> else
+                                --> pmu->start_txn(pmu, PERF_PMU_TXN_READ); //read group
+                                --> pmu->read(event);
+                                --> sub->pmu->read(sub);
+                                --> data->ret = pmu->commit_txn(pmu);
+                    // PERF_EVENT_STATE_INACTIVE
+                    --> perf_event_update_time(event); 
+                --> ...
+                --> values[n++] += perf_event_count(leader);
+                --> ...
+                -->	for_each_sibling_event(sub, leader) {
+		            --> values[n++] += perf_event_count(sub);
+                    --> ...
+            --> list_for_each_entry(child, &leader->child_list, child_list)
+                -->  __perf_read_group_add(child, read_format, values);
+            --> copy_to_user(buf, values, event->read_size)
+        // 读取单个事件
+        -->  perf_read_one(event, read_format, buf);
+            --> u64 values[5];
+            --> values[n++] = __perf_event_read_value(event, &enabled, &running);
+            --> ...
+            --> copy_to_user(buf, values, n * sizeof(u64)
+```
+
+读取数据时按照 `attr.read_format` 进行数据格式封装后拷贝到用户缓冲区中。设置 `PERF_FORMAT_GROUP` 时按照组进行组织数据格式，对应 `perf_read_group` 函数，数据格式如下：
+
+```json
+{ u64   nr;
+    { u64   time_enabled; } && PERF_FORMAT_TOTAL_TIME_ENABLED
+    { u64   time_running; } && PERF_FORMAT_TOTAL_TIME_RUNNING
+    { u64   value;
+        { u64   id;   } && PERF_FORMAT_ID
+        { u64   lost; } && PERF_FORMAT_LOST
+    } cntr[nr];
+} && PERF_FORMAT_GROUP
+```
+
+只读取单个数据时，对应 `perf_read_one` 函数，数据格式如下：
+
+```json
+ { u64      value;
+    { u64       time_enabled; } && PERF_FORMAT_TOTAL_TIME_ENABLED
+    { u64       time_running; } && PERF_FORMAT_TOTAL_TIME_RUNNING
+    { u64       id;           } && PERF_FORMAT_ID
+    { u64       lost;         } && PERF_FORMAT_LOST
+ } && !PERF_FORMAT_GROUP
+```
+
+### 4.3 释放接口 -- perf_release
+
+`perf_release` 函数释放资源信息，实现如下：
+
+```C
+static int perf_release(struct inode *inode, struct file *file)
+    --> perf_event_release_kernel(file->private_data);
+        --> if (!is_kernel_event(event))
+            // 从owner中移除
+            --> perf_remove_from_owner(event);
+                --> owner = READ_ONCE(event->owner);
+                    --> if (event->owner) 
+                        --> list_del_init(&event->owner_entry);
+                        --> smp_store_release(&event->owner, NULL);
+        // 上下文移除
+        --> perf_remove_from_context(event, DETACH_GROUP|DETACH_DEAD);
+            --> event_function_call(event, __perf_remove_from_context, (void *)flags);
+                --> __perf_remove_from_context
+                    // 切出事件
+                    --> event_sched_out(event, ctx);
+                    --> if (flags & DETACH_GROUP) perf_group_detach(event);
+                    --> if (flags & DETACH_CHILD) perf_child_detach(event);
+                    --> list_del_event(event, ctx);
+        // 子事件异常
+        --> list_for_each_entry(child, &event->child_list, child_list)
+            --> ctx = READ_ONCE(child->ctx);
+            --> tmp = list_first_entry_or_null(&event->child_list, ...);
+                --> if (tmp == child) {
+                    --> perf_remove_from_context(child, DETACH_GROUP);
+                    --> list_move(&child->child_list, &free_list);
+                    --> put_event(event);
+            --> put_ctx(ctx);
+        --> list_for_each_entry_safe(child, tmp, &free_list, child_list)
+            --> list_del(&child->child_list);
+            --> free_event(child);
+        // 是否事件
+        --> put_event(event);
+            --> _free_event(event);
+                --> unaccount_event(event);
+                --> ring_buffer_attach(event, NULL); // if (event->rb)
+                --> if (is_cgroup_event(event))	perf_detach_cgroup(event);
+                --> perf_event_free_bpf_prog(event);
+                --> perf_addr_filters_splice(event, NULL);
+                --> if (event->destroy) event->destroy(event);
+                --> if (event->hw.target) put_task_struct(event->hw.target);
+                --> if (event->pmu_ctx)	put_pmu_ctx(event->pmu_ctx);
+                --> if (event->ctx) put_ctx(event->ctx);
+                --> exclusive_event_destroy(event);
+                --> call_rcu(&event->rcu_head, free_event_rcu);
+                    --> free_event_rcu
+                        --> if (event->ns) put_pid_ns(event->ns);
+                        --> perf_event_free_filter(event);
+                        --> kmem_cache_free(perf_event_cache, event);
+```
+
+整个释放过程比较复杂，逐级调用 `perf_remove_from_context` 函数，进而调用 `event_sched_out` 将事件切出。`put_event` 函数释放event资源和清理资源，最终通过将资源释放到 `perf_event_cache`。
 
 ## 5 PMU的注册和卸载
 
@@ -771,21 +948,27 @@ int perf_event_set_bpf_prog(struct perf_event *event, struct bpf_prog *prog, u64
 int perf_pmu_register(struct pmu *pmu, const char *name, int type)
     --> pmu->pmu_disable_count = alloc_percpu(int);
     --> pmu->name = name;
+    // 分配type，name== null或PERF_TYPE_SOFTWARE除外
     --> ret = idr_alloc(&pmu_idr, pmu, max, 0, GFP_KERNEL);  // type != PERF_TYPE_SOFTWARE
     --> pmu->type = type;
+    // 分配设备文件
     --> pmu_dev_alloc(pmu); // if pmu_bus_running
     --> pmu->cpu_pmu_context = alloc_percpu(struct perf_cpu_pmu_context);
     --> for_each_possible_cpu(cpu)
         -->	cpc = per_cpu_ptr(pmu->cpu_pmu_context, cpu);
 		--> __perf_init_event_pmu_context(&cpc->epc, pmu);
+        // 定时器初始化
 		--> __perf_mux_hrtimer_init(cpc, cpu);
+            // 最小1ms
             --> interval = pmu->hrtimer_interval_ms; // or PERF_CPU_HRTIMER = 1ms
             --> cpc->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * interval); 
             --> hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED_HARD);
             --> timer->function = perf_mux_hrtimer_handler;
+    // 默认函数设置
     --> pmu->start_txn  = perf_pmu_start_txn; // if (!pmu->start_txn)
     --> ...
     --> pmu->event_idx = perf_event_idx_default; //if (!pmu->event_idx)
+    // software添加到前面
     --> list_add_rcu(&pmu->entry, &pmus);  // if (type == PERF_TYPE_SOFTWARE || !name)
     --> list_add_tail_rcu(&pmu->entry, &pmus); // otherwise
     --> atomic_set(&pmu->exclusive_cnt, 0);
@@ -836,18 +1019,26 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
         --> perf_event_init_all_cpus();
             --> for_each_possible_cpu(cpu) 
                 --> swhash = &per_cpu(swevent_htable, cpu);
+                // CPU维度上下文
                 --> cpuctx = per_cpu_ptr(&perf_cpu_context, cpu);
         --> init_srcu_struct(&pmus_srcu);
+        // software pmu注册
         --> perf_pmu_register(&perf_swevent, "software", PERF_TYPE_SOFTWARE);
         --> perf_pmu_register(&perf_cpu_clock, NULL, -1);
         --> perf_pmu_register(&perf_task_clock, NULL, -1);
         --> perf_tp_register();
+            // tp pmu注册
             --> perf_pmu_register(&perf_tracepoint, "tracepoint", PERF_TYPE_TRACEPOINT);
             --> perf_pmu_register(&perf_kprobe, "kprobe", -1);
             --> perf_pmu_register(&perf_uprobe, "uprobe", -1);
         --> perf_event_init_cpu(smp_processor_id());
+            // sw事件初始化
             --> perf_swevent_init_cpu(cpu);
+                --> struct swevent_htable *swhash = &per_cpu(swevent_htable, cpu);
+                --> hlist = kzalloc_node(sizeof(*hlist), GFP_KERNEL, cpu_to_node(cpu));
+                --> rcu_assign_pointer(swhash->swevent_hlist, hlist);
         --> register_reboot_notifier(&perf_reboot_notifier);
+        // hw断点pmu注册
         --> init_hw_breakpoint();
             --> rhltable_init(&task_bps_ht, &task_bps_ht_params);
             --> init_breakpoint_slots();
@@ -876,7 +1067,7 @@ module_init(cstate_pmu_init);
 ...
 ```
 
-和PMU相关的内容我们在下一节进行分析，这里我们只分析 `perf_event_sysfs_init` 。 实现如下：
+和PMU相关的内容我们在其他章节进行分析，这里我们只分析 `perf_event_sysfs_init` 。 实现如下：
 
 ```C
 static int pmu_bus_running;
@@ -884,7 +1075,7 @@ static struct bus_type pmu_bus = {
 	.name		= "event_source",
 	.dev_groups	= pmu_dev_groups,
 };
-// kernel/events/core.c
+//file: kernel/events/core.c
 static int __init perf_event_sysfs_init(void)
     --> ret = bus_register(&pmu_bus);
         --> priv = kzalloc(sizeof(struct subsys_private), GFP_KERNEL);
@@ -902,8 +1093,18 @@ static int __init perf_event_sysfs_init(void)
             --> pmu->dev = kzalloc(sizeof(struct device), GFP_KERNEL);
             --> pmu->dev->groups = pmu->attr_groups;
             --> device_initialize(pmu->dev);
+            --> pmu->dev->bus = &pmu_bus;
             --> dev_set_name(pmu->dev, "%s", pmu->name);
             --> device_add(pmu->dev);
+                --> device_create_file(dev, &dev_attr_uevent);
+                    --> sysfs_create_file(&dev->kobj, &attr->attr);
+                --> device_add_class_symlinks(dev);
+                    --> sysfs_create_link(&dev->kobj, of_node_kobj(of_node), "of_node");
+                    --> sysfs_create_link(&dev->kobj, &dev->class->p->subsys.kobj, "subsystem");
+                    --> sysfs_create_link(&dev->kobj, dev->parent->kobj, "device");
+                    --> sysfs_create_link(&dev->class->p->subsys.kobj, &dev->kobj, dev_name(dev));
+                --> device_add_attrs(dev);
+                --> bus_add_device(dev);
             --> device_create_file(pmu->dev, &dev_attr_nr_addr_filters); // if (pmu->nr_addr_filters) 
             --> sysfs_update_groups(&pmu->dev->kobj, pmu->attr_update);
     --> pmu_bus_running = 1;
@@ -942,9 +1143,9 @@ $ tree /sys/bus/event_source/
 19 directories, 3 files
 ```
 
-## 6 perf事件用户内存映射
+## 6 总结
 
-略。
+本文分析了`minimal`示例挂载BPF程序到内核过程中的前半部分，分析了 `perf_event_open` 的实现过程。由于主要关注BPF相关内容，perf_event 用户空间内存映射这部分内容省略。
 
 ## 参考资料
 
