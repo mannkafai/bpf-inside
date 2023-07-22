@@ -74,10 +74,14 @@ set(LIBBPF_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}/libbpf)
 set(LIBBPF_LIBRARIES ${CMAKE_CURRENT_BINARY_DIR}/libbpf/libbpf.a)
 find_package(BpfObject REQUIRED)
 
+set(BZ_APPS profile)
+
 # Create an executable for each application
 file(GLOB apps *.bpf.c)
 if(NOT CARGO_EXISTS)
-  list(REMOVE_ITEM apps ${CMAKE_CURRENT_SOURCE_DIR}/profile.bpf.c)
+  foreach(app ${BZ_APPS})
+    list(REMOVE_ITEM apps ${CMAKE_CURRENT_SOURCE_DIR}/${app}.bpf.c)
+  endforeach()
 endif()
 foreach(app ${apps})
   get_filename_component(app_stem ${app} NAME_WE)
@@ -88,10 +92,13 @@ foreach(app ${apps})
 
   add_executable(${app_stem} ${app_stem}.c)
   target_link_libraries(${app_stem} ${app_stem}_skel)
-  if(${app_stem} STREQUAL profile)
+endforeach()
+
+if(CARGO_EXISTS)
+  foreach(app_stem ${BZ_APPS})
     target_include_directories(${app_stem} PRIVATE
       ${PROJECT_ROOT}/blazesym/include)
     target_link_libraries(${app_stem}
       ${PROJECT_ROOT}/blazesym/target/release/libblazesym.a -lpthread -lrt -ldl)
-  endif()
-endforeach()
+  endforeach()
+endif()
