@@ -8,6 +8,7 @@
 * [Linux性能计数器在内核的实现](doc/02-Performance%20Counters%20for%20Linux.md)
 * [Tracepoint的内核实现](doc/03-tracepoint%20inside.md)
 * [CPU-PMU的内核实现](doc/04-cpu%20pmu.md)
+* [SOFTWARE-PMU的内核实现](doc/05-software%20pmu.md)
 
 
 ## 编译示例
