@@ -2,7 +2,7 @@
 
 ## 0 前言
 
-在[inux性能计数器在内核的实现](02-01-Performance%20Counters%20for%20Linux.md)中，我们分析了 perf_events 的实现过程，简单介绍了PMU的注册过程。今天我们基于`profile`程序分析CPU-PMU的实现过程。
+在[inux性能计数器在内核的实现](02-Performance%20Counters%20for%20Linux.md)中，我们分析了 perf_events 的实现过程，简单介绍了PMU的注册过程。今天我们基于`profile`程序分析CPU-PMU的实现过程。
 
 ## 1 简介
 
@@ -1285,7 +1285,7 @@ static void hw_perf_event_destroy(struct perf_event *event)
     --> atomic_dec(&active_events);
 ```
 
-### 3.3 触发过程
+### 3.3 事件触发的方式
 
 在CPU-pmu初始化过程中，我们设置总是使用NMI，如下：
 
@@ -1488,7 +1488,9 @@ int perf_event_overflow(struct perf_event *event, struct perf_sample_data *data,
         --> ...
 ```
 
-#### 4 设置BPF程序
+### 3.4 BPF程序调用的过程
+
+#### 1 设置BPF程序
 
 在 `perf_event` 通过`ioctl`方式或`bpf`系统调用（`BPF_LINK_CREATE`）设置BPF程序时，调用 `perf_event_set_bpf_prog` 函数进行设置，如下：
 
@@ -1514,7 +1516,7 @@ static int perf_event_set_bpf_handler(struct perf_event *event, struct bpf_prog 
 
 CPU采样事件不属于追踪事件，通过 `perf_event_set_bpf_handler` 设置bpf程序到 `event->prog` 中。
 
-#### 5 调用BPF程序
+#### 2 调用BPF程序
 
 在事件设置BPF程序后，溢出处理函数为 `bpf_overflow_handler`，实现如下：
 
@@ -1546,7 +1548,7 @@ out:
 }
 ```
 
-### 3.4 BTS-PMU
+### 3.5 BTS-PMU
 
 在使用CPU-pmu事件过程中，我们看到BTS相关信息。Intel BTS的性能分析器来识别和解决性能瓶颈，可以帮助找出代码中的热点，了解函数调用和内存使用情况。注册过程如下：
 

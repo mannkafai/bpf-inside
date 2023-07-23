@@ -388,7 +388,8 @@ static const struct file_operations perf_fops = {
 在CPU调度过程中，在进行任务上下文切换perf事件。在切换任务前调用 `perf_event_task_sched_out` , 在切换任务后调用 `perf_event_task_sched_in` 。主要的实现过程如下：
 
 ```C
-schedule()
+// file: kernel/sched/core.c
+asmlinkage __visible void __sched schedule(void)
     --> __schedule(SM_NONE);
         --> next = pick_next_task(rq, prev, &rf); //struct task_struct *
         --> rq = context_switch(rq, prev, next, &rf);
