@@ -74,6 +74,11 @@ set(LIBBPF_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}/libbpf)
 set(LIBBPF_LIBRARIES ${CMAKE_CURRENT_BINARY_DIR}/libbpf/libbpf.a)
 find_package(BpfObject REQUIRED)
 
+file(GLOB helpers *_helpers.c)
+# list(APPEND helpers compat.c)
+add_library(helper STATIC ${helpers})
+target_include_directories(helper PRIVATE ${LIBBPF_INCLUDE_DIRS})
+
 set(BZ_APPS profile)
 
 # Create an executable for each application
@@ -91,7 +96,7 @@ foreach(app ${apps})
   add_dependencies(${app_stem}_skel libbpf-build bpftool-build)
 
   add_executable(${app_stem} ${app_stem}.c)
-  target_link_libraries(${app_stem} ${app_stem}_skel)
+  target_link_libraries(${app_stem} ${app_stem}_skel helper)
 endforeach()
 
 if(CARGO_EXISTS)
