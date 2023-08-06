@@ -9,6 +9,7 @@
 * [Tracepoint的内核实现](doc/03-tracepoint%20inside.md)
 * [CPU-PMU的内核实现](doc/04-cpu%20pmu.md)
 * [SOFTWARE-PMU的内核实现](doc/05-software%20pmu.md)
+* [KPROBE的内核实现](doc/06-kprobe%20pmu.md)
 
 
 ## 编译示例
