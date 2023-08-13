@@ -1041,7 +1041,7 @@ static ssize_t probes_write(struct file *file, const char __user *buffer,
 `trace_parse_run_command` 函数按行解析文件内容后，逐行调用`createfn`。 实现如下：
 
 ```C
-// file: kernel/trace/trace_kprobe.c
+// file: kernel/trace/trace.c
 ssize_t trace_parse_run_command(struct file *file, const char __user *buffer,
                 size_t count, loff_t *ppos, int (*createfn)(const char *))
 {
@@ -1360,7 +1360,7 @@ static int trace_kprobe_release(struct dyn_event *ev)
     --> free_trace_kprobe(tk);
 ```
 
-### 4.4 kprobe的内核实现
+### 4.4 KPROBE-REG接口的实现
 
 #### 1 注册过程
 
@@ -1683,7 +1683,7 @@ void unregister_kretprobes(struct kretprobe **rps, int num)
 
 #### 3 开启过程
 
-`perf_trace_event_init` 函数调用了 `TRACE_REG_PERF_REGISTER` 指令，对应 `enable_trace_kprobe` 操作。`enable_trace_kprobe` 函数开启kprobe事件，实现如下：
+`perf_trace_event_reg` 函数调用了 `TRACE_REG_PERF_REGISTER` 指令，对应 `enable_trace_kprobe` 操作。`enable_trace_kprobe` 函数开启kprobe事件，实现如下：
 
 ```C
 // file: kernel/trace/trace_kprobe.c
@@ -2280,89 +2280,11 @@ unlock:
 
 `kprobe`和`Tracepoint`属于`tracing`事件，通过`perf_event_attach_bpf_prog` 添加bpf程序到 `tp_event->prog_array` 列表中。
 
-#### 6 kprobe的触发过程
+### 4.5 kprobe的触发过程
 
-我们通过qemu搭建Linux内核调试环境后，通过gdb调试内核。搭建过程参见[在macOS下搭建Linux内核调试环境](https://github.com/mannkafai/mkf.github.io/blob/main/debug%20linux%20kernel%20on%20macos.md)。
+#### 1 触发`ftrace_handler`
 
-##### （1）附加BPF程序
-
-以`kprobe`程序为例，我们通过gdb查看附加BPF程序前后 `do_unlinkat` 调用的变化。
-
-附加BPF程序前`do_unlinkat`函数汇编代码：
-
-```bash
-(gdb) disassemble do_unlinkat 
-Dump of assembler code for function do_unlinkat:
-   0xffffffff814935b0 <+0>:	nopl   0x0(%rax,%rax,1)
-   0xffffffff814935b5 <+5>:	push   %rbp
-   0xffffffff814935b6 <+6>:	mov    %rsp,%rbp
-   ...
-```
-
-`do_unlinkat` 函数的前5个字节为nop指令，对应`BYTES_NOP5`。
-
-```C
-// 5: nopl 0x00(%eax,%eax,1)
-#define BYTES_NOP5	0x0f,0x1f,0x44,0x00,0x00
-```
-
-在qemu系统中编译并运行BPF程序，如下：
-
-```bash
-$ cd build
-$ cmake ../src
-$ make kprobe
-$ sudo ./kprobe 
-Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` to see output of the BPF programs.
-....
-```
-
-附加BPF程序后`do_unlinkat`函数汇编代码：
-
-```bash
-(gdb) disassemble do_unlinkat 
-Dump of assembler code for function do_unlinkat:
-   0xffffffff814935b0 <+0>:	call   0xffffffffc0227000
-   0xffffffff814935b5 <+5>:	push   %rbp
-   0xffffffff814935b6 <+6>:	mov    %rsp,%rbp
-   ...
-```
-
-此时，将`BYTES_NOP5`替换为`call 0xffffffffc0227000` 指令。`0xffffffffc0227000` 即 `kprobe_ftrace_ops` 的trampoline地址。
-
-##### （2）调用`ftrace_ops->trampoline`
-
-在gdb中通过`x/i`查看`kprobe_ftrace_ops->trampoline`的汇编代码，如下：
-
-```C
-(gdb) x/100i 0xffffffffc0227000
-   0xffffffffc0227000:	pushf  
-   0xffffffffc0227001:	push   %rbp
-   0xffffffffc0227002:	push   0x18(%rsp)
-   0xffffffffc0227006:	push   %rbp
-   0xffffffffc0227007:	mov    %rsp,%rbp
-   0xffffffffc022700a:	push   0x20(%rsp)
-   ...
-   0xffffffffc022704d:	mov    %rdx,0x20(%rsp)
-   0xffffffffc0227052:	mov    0xe0(%rsp),%rsi
-   0xffffffffc022705a:	mov    0xd8(%rsp),%rdi
-   0xffffffffc0227062:	mov    %rdi,0x80(%rsp)
-   0xffffffffc022706a:	sub    $0x5,%rdi
-   0xffffffffc022706e:	nopl   0x0(%rax,%rax,1)
-   0xffffffffc0227076:	xchg   %ax,%ax
-   0xffffffffc0227078:	mov    0xfc(%rip),%rdx        # 0xffffffffc022717b
-   0xffffffffc022707f:	mov    %r15,(%rsp)
-   0xffffffffc0227083:	mov    %r14,0x8(%rsp)
-   ...
-   0xffffffffc02270df:	lea    0x1(%rsp),%rbp
-   0xffffffffc02270e4:	lea    (%rsp),%rcx
-   0xffffffffc02270e8:	nopl   0x0(%rax,%rax,1)
-   0xffffffffc02270f0:	xchg   %ax,%ax
-   0xffffffffc02270f2:	call   0xffffffff810b0440 <kprobe_ftrace_handler>
-   ...
-```
-
-通过汇编代码，我们可以看到`trampoline`修改`%rdi`,`%rsi`,`%rdx`,`%rcx`寄存器值后(对应第1~4个参数)，调用 `kprobe_ftrace_handler` 函数。后者实现如下：
+在内核调用我们探测的函数时，进入设置的蹦床中执行。在蹦床中调用设置的 `kprobe_ftrace_handler` 函数。后者实现如下：
 
 ```C
 // file: arch/x86/kernel/kprobes/ftrace.c
@@ -2414,7 +2336,7 @@ out:
 }
 ```
 
-##### （3）触发`pre_handler`
+#### 2 触发`pre_handler`
 
 在同一个地址中添加多个`kprobe`时，创建了`aggr_kprobe`，设置了`pre_handler` 处理函数，如下：
 
@@ -2447,7 +2369,7 @@ static int aggr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 }
 ```
 
-##### （4）`kprobe`的执行过程
+#### 3 `kprobe`的执行过程
 
 在注册kprobe过程中设置了`pre_handler`，如下：
 
@@ -2483,9 +2405,7 @@ static int kprobe_dispatcher(struct kprobe *kp, struct pt_regs *regs)
 }
 ```
 
-`kprobe_dispatcher` 函数检查`TRACE` 和 `PROFILE` 标记，存在对应标记时，调用 `kprobe_trace_func` 和 `kprobe_perf_func` 函数。
-
-我们需要调用BPF程序时，在`trace_event`初始化时调用了 `TRACE_REG_PERF_REGISTER` 指令，设置了 `TP_FLAG_PROFILE` 标记，将执行 `kprobe_perf_func` 函数。实现过程如下：
+`kprobe_dispatcher` 函数检查`TRACE` 和 `PROFILE` 标记，存在对应标记时，调用 `kprobe_trace_func` 和 `kprobe_perf_func` 函数。我们需要调用BPF程序时，在`trace_event`初始化时调用了 `TRACE_REG_PERF_REGISTER` 指令，设置了 `TP_FLAG_PROFILE` 标记，将执行 `kprobe_perf_func` 函数。实现过程如下：
 
 ```C
 // file: kernel/trace/trace_kprobe.c
@@ -2532,7 +2452,7 @@ unsigned int trace_call_bpf(struct trace_event_call *call, void *ctx)
 }
 ```
 
-##### （5）`kretprobe`的执行过程
+#### 4 `kretprobe`的执行过程
 
 在注册`kretprobe`过程中，设置了`pre_handler` 和 `rethook`，如下：
 
@@ -2546,6 +2466,8 @@ int register_kretprobe(struct kretprobe *rp)
     rp->rh = rethook_alloc((void *)rp, kretprobe_rethook_handler);
 }
 ```
+
+##### （1）设置rethook
 
 `pre_handler_kretprobe` 函数实现`kretprobe`的准备过程，实现如下：
 
@@ -2592,6 +2514,8 @@ void arch_rethook_prepare(struct rethook_node *rh, struct pt_regs *regs, bool mc
     stack[0] = (unsigned long) arch_rethook_trampoline;
 }
 ```
+
+##### （2）执行`rethook_trampoline`
 
 函数执行完成后，调用`ret`指令返回上一个函数继续执行，此时返回`rethook`设置的地址，即 `arch_rethook_trampoline`，该函数通过汇编编写的，如下：
 
@@ -2655,6 +2579,7 @@ __used __visible void arch_rethook_trampoline_callback(struct pt_regs *regs)
 `rethook_trampoline_handler` 函数实现`rethook`的调用，实现如下：
 
 ```C
+// file: kernel/trace/rethook.c
 unsigned long rethook_trampoline_handler(struct pt_regs *regs, unsigned long frame)
 {
     ...
@@ -2728,6 +2653,8 @@ static struct trace_kprobe *alloc_trace_kprobe(const char *group, ...)
 }
 ```
 
+##### （3）执行`kretprobe_dispatcher`
+
 `kretprobe_dispatcher` 函数和`kprobe_dispatcher` 函数类似，判断`TRACE`和`PROFILE`标记后调用相关函数，实现如下：
 
 ```C
@@ -2781,9 +2708,32 @@ static void kretprobe_perf_func(struct trace_kprobe *tk, struct kretprobe_instan
 }
 ```
 
-##### （6）清理BPF程序
+### 4.6 GDB调试验证
 
-在qemu中退出`kprobe`程序后，我们通过gdb查看 `do_unlinkat` 的反汇编代码，重新设置为nop指令，如下：
+我们通过qemu搭建Linux内核调试环境后，通过gdb调试内核。搭建过程参见[在macOS下搭建Linux内核调试环境](https://github.com/mannkafai/mkf.github.io/blob/main/debug%20linux%20kernel%20on%20macos.md)。
+
+以`kprobe`程序为例，我们通过gdb查看 `do_unlinkat` 调用的变化。
+
+#### 1 start_kernel前
+
+```bash
+(gdb) b start_kernel 
+Breakpoint 1 at 0xffffffff836620c0: file /<path>/init/main.c, line 941.
+(gdb) c
+Continuing.
+
+Thread 1 hit Breakpoint 1, start_kernel () at /<path>/init/main.c:941
+(gdb) disassemble do_unlinkat 
+Dump of assembler code for function do_unlinkat:
+   0xffffffff814935b0 <+0>:	call   0xffffffff810a98c0 <__fentry__>
+   0xffffffff814935b5 <+5>:	push   %rbp
+   0xffffffff814935b6 <+6>:	mov    %rsp,%rbp
+   ...
+```
+
+#### 2 start_kernel后
+
+Linux系统启动后，通过`Ctrl-C`中断，查看如下：
 
 ```bash
 (gdb) disassemble do_unlinkat 
@@ -2794,11 +2744,407 @@ Dump of assembler code for function do_unlinkat:
    ...
 ```
 
-## 5 总结
+`do_unlinkat` 函数的前5个字节替换为nop指令，对应`BYTES_NOP5`。
+
+```C
+// 5: nopl 0x00(%eax,%eax,1)
+#define BYTES_NOP5	0x0f,0x1f,0x44,0x00,0x00
+```
+
+#### 3 附加BPF程序
+
+在qemu系统中编译并运行BPF程序，如下：
+
+```bash
+$ cd build
+$ cmake ../src
+$ make kprobe
+$ sudo ./kprobe 
+Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` to see output of the BPF programs.
+....
+```
+
+附加BPF程序后查看`do_unlinkat`函数反汇编代码：
+
+```bash
+(gdb) disassemble do_unlinkat 
+Dump of assembler code for function do_unlinkat:
+   0xffffffff814935b0 <+0>:	call   0xffffffffc0262000
+   0xffffffff814935b5 <+5>:	push   %rbp
+   0xffffffff814935b6 <+6>:	mov    %rsp,%rbp
+   ...
+```
+
+此时，将`BYTES_NOP5`替换为`call 0xffffffffc0262000` 指令。`0xffffffffc0262000` 即 `kprobe_ftrace_ops` 的trampoline地址。
+
+在gdb中通过`x/i`查看对应的汇编代码，如下：
+
+```C
+(gdb) x/100i 0xffffffffc0262000
+   0xffffffffc0262000:	pushf  
+   0xffffffffc0262001:	push   %rbp
+   0xffffffffc0262002:	push   0x18(%rsp)
+   ...
+   0xffffffffc0262052:	mov    0xe0(%rsp),%rsi
+   0xffffffffc026205a:	mov    0xd8(%rsp),%rdi
+   0xffffffffc0262062:	mov    %rdi,0x80(%rsp)
+   0xffffffffc026206a:	sub    $0x5,%rdi
+   0xffffffffc026206e:	nopl   0x0(%rax,%rax,1)
+   0xffffffffc0262076:	xchg   %ax,%ax
+   0xffffffffc0262078:	mov    0xfc(%rip),%rdx        # 0xffffffffc026217b
+   0xffffffffc026207f:	mov    %r15,(%rsp)
+   ...
+   0xffffffffc02620df:	lea    0x1(%rsp),%rbp
+   0xffffffffc02620e4:	lea    (%rsp),%rcx
+   0xffffffffc02620e8:	nopl   0x0(%rax,%rax,1)
+   0xffffffffc02620f0:	xchg   %ax,%ax
+   0xffffffffc02620f2:	call   0xffffffff810b0440 <kprobe_ftrace_handler>
+   ...
+```
+
+通过汇编代码，我们可以看到`trampoline`修改`%rdi`,`%rsi`,`%rdx`,`%rcx`寄存器值后(对应第1~4个参数)，调用 `kprobe_ftrace_handler` 函数。
+
+#### 4 查看kretprobe执行过程
+
+设置`do_unlinkat`函数入口位置断点，
+
+```bash
+// "do_unlinkat"函数入口地址
+(gdb) b do_unlinkat 
+Breakpoint 16 at 0xffffffff814935b0: file /<path>/fs/namei.c, line 4281.
+// "do_unlinkat"函数第二条指令
+(gdb) b *0xffffffff814935b5
+Breakpoint 17 at 0xffffffff814935b5: file /<path>/fs/namei.c, line 4281.
+(gdb) c
+Continuing.
+
+Thread 3 hit Breakpoint 16, do_unlinkat (dfd=dfd@entry=-100, name=0xffff88810b3cc000) at /<path>/fs/namei.c:4281
+4281	{
+// 触发"do_unlinkat"断点，查看rsp寄存器状态
+(gdb) i r rsp
+rsp            0xffffc90002593ea8  0xffffc90002593ea8
+(gdb) x/2a $rsp
+0xffffc90002593ea8:	0xffffffff814939e2 <__x64_sys_unlink+66>	0x0 <fixed_percpu_data>
+
+(gdb) c
+Continuing.
+
+Thread 3 hit Breakpoint 17, 0xffffffff814935b5 in do_unlinkat (dfd=-100, name=0xffff88810b3cc000) at /<path>/fs/namei.c:4281
+4281	{
+// 触发"do_unlinkat"函数第二条指令断点，查看rsp寄存器状态
+(gdb) i r rsp
+rsp            0xffffc90002593ea8  0xffffc90002593ea8
+(gdb) x/2a $rsp
+0xffffc90002593ea8:	0xffffffff810aa3c0 <arch_rethook_trampoline>	0x0 <fixed_percpu_data>
+```
+
+可以看到，执行第一条指令`call   0xffffffffc0262000`前后，`%rsp`寄存器位置的值发送了变化，由 `0xffffffff814939e2 <__x64_sys_unlink+66>` 变成了 `0xffffffff810aa3c0 <arch_rethook_trampoline>`。 `do_unlinkat`函数执行完成后跳转到 `arch_rethook_trampoline` 位置继续执行，对应的反汇编代码如下：
+
+```bash
+(gdb) disassemble  arch_rethook_trampoline
+Dump of assembler code for function arch_rethook_trampoline:
+   0xffffffff810aa3c0 <+0>:	push   $0xffffffff810aa3c0
+   0xffffffff810aa3c5 <+5>:	push   $0x18
+   0xffffffff810aa3c7 <+7>:	push   %rsp
+   ...
+   0xffffffff810aa3e9 <+41>:	mov    %rsp,%rdi
+   0xffffffff810aa3ec <+44>:	call   0xffffffff810aa4b0 <arch_rethook_trampoline_callback>
+   ...
+   0xffffffff810aa408 <+72>:	add    $0x18,%rsp
+   0xffffffff810aa40c <+76>:	add    $0x10,%rsp
+   0xffffffff810aa410 <+80>:	popf   
+   0xffffffff810aa411 <+81>:	ret
+   0xffffffff810aa412 <+82>:	int3 
+   ...  
+```
+
+设置`arch_rethook_trampoline`断点为最后一条可执行的指令位置(`ret`指令)，查看寄存器状态，如下
+
+```bash
+(gdb) b *0xffffffff810aa411
+Breakpoint 19 at 0xffffffff810aa411
+(gdb) c
+Continuing.
+
+Thread 3 hit Breakpoint 19, 0xffffffff810aa411 in arch_rethook_trampoline ()
+(gdb) i r rsp
+rsp            0xffffc90002593ea8  0xffffc90002593ea8
+(gdb) x/2a $rsp
+0xffffc90002593ea8:	0xffffffff814939e2 <__x64_sys_unlink+66>	0x0 <fixed_percpu_data>
+```
+
+此时，`%rsp`寄存器和保存的值恢复到调用`do_unlinkat`之前的状态。
+
+#### 5 清理BPF程序后
+
+在qemu中退出`kprobe`程序后，查看`do_unlinkat` 的反汇编代码，重新设置为nop指令，如下：
+
+```bash
+(gdb) disassemble do_unlinkat 
+Dump of assembler code for function do_unlinkat:
+   0xffffffff814935b0 <+0>:	nopl   0x0(%rax,%rax,1)
+   0xffffffff814935b5 <+5>:	push   %rbp
+   0xffffffff814935b6 <+6>:	mov    %rsp,%rbp
+   ...
+```
+
+## 5 ksyscall示例程序
+
+libbpf实现了对系统调用函数的`kprobe`探测。
+
+### 5.1 BPF程序
+
+BPF程序的源码参见[ksyscall.bpf.c](../src/ksyscall.bpf.c)，主要内容如下：
+
+```C
+SEC("ksyscall/unlinkat")
+int BPF_KSYSCALL(unlinkat_entry, int fd, const char *pathname, int flag)
+{
+	char comm[TASK_COMM_LEN];
+	__u32 caller_pid = bpf_get_current_pid_tgid() >> 32;
+	
+	bpf_get_current_comm(&comm, sizeof(comm));
+	bpf_printk( "PID %d (%s) unlinkat syscall called with fd[%d], pathname[%s] and flag[%d].",
+		caller_pid, comm, fd, pathname, flag);
+	return 0;
+}
+
+SEC("kretsyscall/unlinkat")
+int BPF_KRETPROBE(unlinkat_return, int ret)
+{
+	char comm[TASK_COMM_LEN];
+	__u32 caller_pid = bpf_get_current_pid_tgid() >> 32;
+
+	bpf_get_current_comm(&comm, sizeof(comm));
+	bpf_printk("PID %d (%s) unlinkat syscall return called  with ret[%d].", caller_pid, comm, ret);
+	return 0;
+}
+```
+
+该程序包括两个BPF程序 `unlinkat_entry` 和 `unlinkat_return` 。
+
+#### `BPF_KSYSCALL`展开过程
+
+`unlinkat_entry` 使用 `BPF_KSYSCALL` 宏，有三个参数 `fd`，`pathname` 和 `flag`。`BPF_KSYSCALL` 宏在 [bpf_tracing.h](../libbpf/src/bpf_tracing.h) 中定义的，如下：
+
+```C
+// file: libbpf/src/bpf_tracing.h
+#define BPF_KSYSCALL(name, args...)					    \
+name(struct pt_regs *ctx);						    \
+extern _Bool LINUX_HAS_SYSCALL_WRAPPER __kconfig;			    \
+static __always_inline typeof(name(0))					    \
+____##name(struct pt_regs *ctx, ##args);				    \
+typeof(name(0)) name(struct pt_regs *ctx)				    \
+{									    \
+	struct pt_regs *regs = LINUX_HAS_SYSCALL_WRAPPER		    \
+			       ? (struct pt_regs *)PT_REGS_PARM1(ctx)	    \
+			       : ctx;					    \
+	_Pragma("GCC diagnostic push")					    \
+	_Pragma("GCC diagnostic ignored \"-Wint-conversion\"")		    \
+	if (LINUX_HAS_SYSCALL_WRAPPER)					    \
+		return ____##name(___bpf_syswrap_args(args));		    \
+	else								    \
+		return ____##name(___bpf_syscall_args(args));		    \
+	_Pragma("GCC diagnostic pop")					    \
+}									    \
+static __always_inline typeof(name(0))					    \
+____##name(struct pt_regs *ctx, ##args)
+```
+
+`BPF_KSYSCALL`宏根据`LINUX_HAS_SYSCALL_WRAPPER`的设置，使用`___bpf_syswrap_args(args)` 或 `___bpf_syscall_args(args)` 获取系统调用的参数。这两种读取参数的顺序一致，`___bpf_syswrap_args(args)` 使用`BPF_CORE_READ`方式读取参数值。 以`___bpf_syscall_args(args)` 为例进行说明，其在同一个文件中定义，展开`args`的参数，如下：
+
+```C
+// file: libbpf/src/bpf_tracing.h
+#define ___bpf_syscall_args0()           ctx
+#define ___bpf_syscall_args1(x)          ___bpf_syscall_args0(), (void *)PT_REGS_PARM1_SYSCALL(regs)
+#define ___bpf_syscall_args2(x, args...) ___bpf_syscall_args1(args), (void *)PT_REGS_PARM2_SYSCALL(regs)
+#define ___bpf_syscall_args3(x, args...) ___bpf_syscall_args2(args), (void *)PT_REGS_PARM3_SYSCALL(regs)
+#define ___bpf_syscall_args4(x, args...) ___bpf_syscall_args3(args), (void *)PT_REGS_PARM4_SYSCALL(regs)
+#define ___bpf_syscall_args5(x, args...) ___bpf_syscall_args4(args), (void *)PT_REGS_PARM5_SYSCALL(regs)
+#define ___bpf_syscall_args6(x, args...) ___bpf_syscall_args5(args), (void *)PT_REGS_PARM6_SYSCALL(regs)
+#define ___bpf_syscall_args7(x, args...) ___bpf_syscall_args6(args), (void *)PT_REGS_PARM7_SYSCALL(regs)
+#define ___bpf_syscall_args(args...)     ___bpf_apply(___bpf_syscall_args, ___bpf_narg(args))(args)
+```
+
+`PT_REGS_PARMn_SYSCALL(ctx)` 宏获取`ctx`的第n个参数。根据`x86_64`架构的调用约定，系统调用最多支持6个参数，`PT_REGS_PARM1_SYSCALL` ~ `PT_REGS_PARM6_SYSCALL` 为 `di`,`si`,`dx`,`r10`,`r8`,`r9` 寄存器。
+
+`int BPF_KSYSCALL(unlinkat_entry, int fd, const char *pathname, int flag)` 宏展开后如下：
+
+```C
+int unlinkat_entry(struct pt_regs *ctx); 
+extern _Bool LINUX_HAS_SYSCALL_WRAPPER __attribute__((section(".kconfig"))); 
+static inline __attribute__((always_inline)) typeof(unlinkat_entry(0)) 
+____unlinkat_entry(struct pt_regs *ctx,int fd, const char *pathname, int flag); 
+typeof(unlinkat_entry(0)) unlinkat_entry(struct pt_regs *ctx) {
+     struct pt_regs *regs = LINUX_HAS_SYSCALL_WRAPPER ? (struct pt_regs *)((ctx)->di) : ctx; 
+     _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wint-conversion\"") 
+    if (LINUX_HAS_SYSCALL_WRAPPER) 
+        return ____unlinkat_entry(ctx, 
+                (void *)({ typeof(((regs))->di) __r;  ({ 
+                            bpf_probe_read_kernel((void *)(&__r), sizeof(*(&__r)), 
+                                (const void *)__builtin_preserve_access_index(&((typeof((((regs))))((((regs)))))->di)); 
+                            });  __r; }), 
+                (void *)({ typeof(((regs))->si) __r; ({ 
+                            bpf_probe_read_kernel((void *)(&__r), sizeof(*(&__r)), 
+                                (const void *)__builtin_preserve_access_index(&((typeof((((regs)))))((((regs)))))->si)); 
+                            }); __r; }), 
+                (void *)({ typeof(((regs))->dx) __r; ({ 
+                            bpf_probe_read_kernel((void *)(&__r), sizeof(*(&__r)), 
+                                (const void *)__builtin_preserve_access_index(&((typeof((((regs)))))((((regs)))))->dx)); 
+                            }); __r; })); 
+     else 
+        return ____unlinkat_entry(ctx, (void *)((regs)->di), (void *)((regs)->si), (void *)((regs)->dx)); 
+     _Pragma("GCC diagnostic pop") 
+}
+static inline __attribute__((always_inline)) typeof(unlinkat_entry(0)) 
+____unlinkat_entry(struct pt_regs *ctx,int fd, const char *pathname, int flag)
+```
+
+`LINUX_HAS_SYSCALL_WRAPPER` 表示Linux内核是否支持`SYSCALL_WRAPPER`，在加载阶段解析，如下：
+
+```C
+// file: bpftool/libbpf/src/libbpf.c
+static int bpf_object__resolve_externs(struct bpf_object *obj, const char *extra_kconfig)
+{
+    ...
+    else if (strcmp(ext->name, "LINUX_HAS_SYSCALL_WRAPPER") == 0) {
+        value = kernel_supports(obj, FEAT_SYSCALL_WRAPPER);
+    }
+}
+```
+
+### 5.2 用户程序
+
+用户程序的源码参见[ksyscall.c](../src/ksyscall.c)，主要功能如下：
+
+#### 1 附加BPF过程
+
+```C
+int main(int argc, char **argv)
+{
+    struct ksyscall_bpf *skel;
+    ...
+    // 打开和加载BPF程序
+    skel = ksyscall_bpf__open_and_load();
+    ...
+    // 附加BPF程序
+    err = ksyscall_bpf__attach(skel);
+    ...
+    // 设置中断信号处理函数
+    if (signal(SIGINT, sig_int) == SIG_ERR) { ... }
+    ...
+    while (!stop) {
+        fprintf(stderr, ".");
+        sleep(1);
+    }
+cleanup:
+    // 卸载BPF程序
+    ksyscall_bpf__destroy(skel);
+    return -err;
+}
+```
+
+#### 2 读取数据过程
+
+`unlinkat_entry` 和 `unlinkat_return` 将采集的数据通过 `bpf_printk` 输出到 `/sys/kernel/debug/tracing/trace_pipe` 文件中。
+
+### 5.3 编译运行程序
+
+使用cmake编译程序后运行，如下：
+
+```bash
+$ cd build
+$ cmake ../src
+$ make ksyscall 
+$ sudo ./ksyscall  
+Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` to see output of the BPF programs.
+....
+```
+
+在`kprobe`程序运行的过程中打开另一个bash窗口查看输出结果，如下：
+
+```bash
+$ sudo cat /sys/kernel/debug/tracing/trace_pipe
+           <...>-811380  [005] d..31 211590.415053: bpf_trace_printk: PID 811380 (rm) unlinkat syscall called with fd[-100], pathname[a.txt] and flag[0].
+           <...>-811380  [005] d..31 211590.415115: bpf_trace_printk: PID 811380 (rm) unlinkat syscall return called  with ret[0].
+...
+```
+
+### 5.4 libbpf附加ksyscall的过程
+
+`ksyscall.bpf.c` 文件中BPF程序的SEC名称分别为 `SEC("ksyscall/unlinkat")` 和 `SEC("kretsyscall/unlinkat")` 。在第一篇中，我们分析了libbpf在附加阶段通过`SEC`名称进行附加的，`ksyscall` 和 `kretsyscall` 对应的处理方式如下：
+
+```C
+// file: libbpf/src/libbpf.c
+static const struct bpf_sec_def section_defs[] = {
+    ...
+	SEC_DEF("ksyscall+",		KPROBE,	0, SEC_NONE, attach_ksyscall),
+	SEC_DEF("kretsyscall+",		KPROBE, 0, SEC_NONE, attach_ksyscall),
+    ...
+};
+```
+
+`ksyscall` 和 `kretsyscall` 都是通过 `attach_ksyscall` 函数进行附加的。`attach_ksyscall` 的实现过程如下：
+
+```C
+// file: libbpf/src/libbpf.c
+static int attach_ksyscall(const struct bpf_program *prog, long cookie, struct bpf_link **link)
+{
+    LIBBPF_OPTS(bpf_ksyscall_opts, opts);
+    const char *syscall_name;
+    *link = NULL;
+
+    // 只有 SEC("ksyscall") and SEC("kretsyscall") 时不自动加载
+    if (strcmp(prog->sec_name, "ksyscall") == 0 || strcmp(prog->sec_name, "kretsyscall") == 0)
+        return 0;
+    // 获取 `syscall_name` 名称
+    opts.retprobe = str_has_pfx(prog->sec_name, "kretsyscall/");
+    if (opts.retprobe)
+        syscall_name = prog->sec_name + sizeof("kretsyscall/") - 1;
+    else
+        syscall_name = prog->sec_name + sizeof("ksyscall/") - 1;
+
+    *link = bpf_program__attach_ksyscall(prog, syscall_name, &opts);
+    return *link ? 0 : -errno;
+}
+```
+
+`attach_ksyscall` 获取`SEC`中的系统调用名称，`bpf_program__attach_ksyscall` 获取系统调用的实际函数名称后，通过kprobe方式附加BPF程序。如下：
+
+```C
+// file: libbpf/src/libbpf.c
+struct bpf_link *bpf_program__attach_ksyscall(const struct bpf_program *prog,
+                    const char *syscall_name, const struct bpf_ksyscall_opts *opts)
+{
+    LIBBPF_OPTS(bpf_kprobe_opts, kprobe_opts);
+    char func_name[128];
+
+    if (!OPTS_VALID(opts, bpf_ksyscall_opts))
+        return libbpf_err_ptr(-EINVAL);
+    
+    // 获取函数名称
+    if (kernel_supports(prog->obj, FEAT_SYSCALL_WRAPPER)) {
+        // 在通过`kernel_supports`检查后，获取系统调用的前缀
+        snprintf(func_name, sizeof(func_name), "__%s_sys_%s", 
+            arch_specific_syscall_pfx() ? : "", syscall_name);
+    } else {
+        snprintf(func_name, sizeof(func_name), "__se_sys_%s", syscall_name);
+    }
+
+    kprobe_opts.retprobe = OPTS_GET(opts, retprobe, false);
+    kprobe_opts.bpf_cookie = OPTS_GET(opts, bpf_cookie, 0);
+    // 附加kprobe
+    return bpf_program__attach_kprobe_opts(prog, func_name, &kprobe_opts);
+}
+```
+
+## 6 总结
 
 本文通过`kprobe`示例程序分析了KRPOBE-PMU的内核实现过程。 `kprobe`/`kretprobe` 事件基于 `ftrace` 实现的，通过修改函数的入口指令，将入口指令修改调用`trampoline` 程序，从而实现调用BPF程序。
 
 `kprobe`探针能够在任意位置插入探针，`kretprobe`只能在函数入口位置插入探针。本文只分析了最常用的 `kprobe`/`kretprobe` 探针在函数入口位置的情况。
+
+除此之外，分析了kprobe实现的特殊情况--ksyscall。系统调用的参数和实际名称与内核中的其他函数有所区别，libbpf通过`ksyscall`段名称进行了通用化处理。
 
 ## 参考资料
 
