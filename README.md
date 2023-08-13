@@ -10,6 +10,7 @@
 * [CPU-PMU的内核实现](doc/04-cpu%20pmu.md)
 * [SOFTWARE-PMU的内核实现](doc/05-software%20pmu.md)
 * [KPROBE的内核实现](doc/06-kprobe%20pmu.md)
+* [UPROBE的内核实现](doc/07-uprobe.md)
 
 
 ## 编译示例
