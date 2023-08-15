@@ -12,6 +12,7 @@
 * [KPROBE的内核实现](doc/06-kprobe%20pmu.md)
 * [UPROBE的内核实现](doc/07-uprobe.md)
 * [RAW TRACEPOINT的内核实现](doc/08-raw%20tracepoint.md)
+* [fentry的内核实现](doc/09-fentry.md)
 
 ## 编译示例
 
