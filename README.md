@@ -14,6 +14,7 @@
 * [RAW TRACEPOINT的内核实现](doc/08-raw%20tracepoint.md)
 * [fentry的内核实现](doc/09-fentry.md)
 * [KPROBE.MULTI的内核实现](doc/10-kprobe_multi.md)
+* [BPF LSM的内核实现](doc/11-bpf%20lsm.md)
 
 ## 编译示例
 
