@@ -16,6 +16,7 @@
 * [KPROBE.MULTI的内核实现](doc/10-kprobe_multi.md)
 * [BPF LSM的内核实现](doc/11-bpf%20lsm.md)
 * [XDP的内核实现](doc/12-xdp.md)
+* [SOCKFILTER的内核实现](doc/13-sockfilter.md)
 
 ## 编译示例
 
