@@ -382,7 +382,7 @@ proceed:
 
 ## 4 内核实现
 
-### 4.2 `netlink`方式附加
+### 4.1 `netlink`方式附加
 
 #### 1 初始化
 
@@ -3829,5 +3829,8 @@ XDP在Linux内核中实现高性能可编程数据包处理，在网络驱动程
 * [linux netlink详解1-netlink初始化](https://www.cnblogs.com/xinghuo123/p/13782009.html)
 * [Linux 网络栈接收数据（RX）：原理及内核实现（2022）](https://arthurchiao.art/blog/linux-net-stack-implementation-rx-zh/)
 * [XDP](https://docs.cilium.io/en/latest/bpf/progtypes/#xdp)
+* [Cilium：BPF 和 XDP 参考指南（2021）](https://arthurchiao.art/blog/cilium-bpf-xdp-reference-guide-zh/)
 * [AF_XDP](https://www.kernel.org/doc/html/latest/networking/af_xdp.html)
 * [AF_XDP技术详解](https://rexrock.github.io/post/af_xdp1/)
+* [XDP (eXpress Data Path)：在操作系统内核中实现快速、可编程包处理（ACM，2018）](https://arthurchiao.art/blog/xdp-paper-acm-2018-zh/)
+* [深入理解 Cilium 的 eBPF 收发包路径（datapath）（KubeCon, 2019）](https://arthurchiao.art/blog/understanding-ebpf-datapath-in-cilium-zh/)
