@@ -693,6 +693,39 @@ out_unlock:
 }
 ```
 
+##### (3) `packet_bind_spkt`实现过程
+
+在`socket`系统调用时，`type`设置为`SOCK_PACKET`，对应`packet_ops_spkt`，定义如下：
+
+```C
+// file: net/packet/af_packet.c
+static const struct proto_ops packet_ops_spkt = {
+    .family =	PF_PACKET,
+    .owner =	THIS_MODULE,
+    .release =	packet_release,
+    .bind =		packet_bind_spkt,
+    ...
+};
+```
+
+`.bind` 接口设置为`packet_bind_spkt`，通过网卡设备名称进行绑定，实现如下：
+
+```C
+// file: net/packet/af_packet.c
+static int packet_bind_spkt(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+{
+    struct sock *sk = sock->sk;
+    char name[sizeof(uaddr->sa_data_min) + 1];
+
+    if (addr_len != sizeof(struct sockaddr)) return -EINVAL;
+    // 获取用户空间设置的网卡设备名称
+    memcpy(name, uaddr->sa_data, sizeof(uaddr->sa_data_min));
+    name[sizeof(uaddr->sa_data_min)] = 0;
+
+    return packet_do_bind(sk, name, 0, 0);
+}
+```
+
 #### 3 注册`prot_hook`
 
 `__register_prot_hook` 函数注册`prot_hook`, 在`packet_sock`没有运行时，注册协议处理程序到网络协议栈中，如下：
@@ -1067,7 +1100,7 @@ static void sk_filter_release(struct sk_filter *fp)
 
 ### 4.3 网络数据抓包实现过程
 
-#### 1 接收路径上抓包
+#### (1) 接收路径上抓包
 
 `__netif_receive_skb_core` 函数将skb发送内核网络协议栈，在 [XDP的内核实现](./12-xdp.md) 中我们分析了XDP的实现过程，在经过XDP处理后，能够继续接收的网络包进行后续处理，下一步就是抓包处理。如下：
 
@@ -1116,7 +1149,7 @@ another_round:
 
 `ptype_all` 和 `skb->dev->ptype_all` 是需要抓包的列表，通过`socket`和`bind`系统调用添加到相应的列表中。
 
-#### 2 发送路径上抓包
+#### (2) 发送路径上抓包
 
 网络数据包发送过程也非常复杂，具体发送过程可参考 [Linux 网络栈监控和调优：发送数据（2017）](http://arthurchiao.art/blog/tuning-stack-tx-zh/)。
 
@@ -1242,9 +1275,9 @@ out_unlock:
 }
 ```
 
-#### 3 抓取数据包的过滤过程
+#### (3) RAW数据包的过滤过程
 
-##### (1) `packet_rcv`实现过程
+##### 1 `packet_rcv`实现过程
 
 在接收/发送过程中抓包通过调用`deliver_skb` 函数 或 `pt_prev->func` 接口，进行后续处理。`deliver_skb` 函数在孤立`skb->frags`，增加skb引用计数后，调用 `pt_prev->func`， 如下：
 
@@ -1259,7 +1292,7 @@ static inline int deliver_skb(struct sk_buff *skb, struct packet_type *pt_prev, 
 }
 ```
 
-在创建`packet_socket`时，设置的`func` 为 `packet_rcv`，如下：
+在创建`packet_socket`时，`RAW`类型设置的`func` 为 `packet_rcv`，如下：
 
 ```C
 // file: net/packet/af_packet.c
@@ -1392,7 +1425,7 @@ drop:
 }
 ```
 
-##### (2) `packet`过滤过程
+##### 2 `packet`过滤过程
 
 `run_filter` 函数实现抓包过程中的过滤，获取和运行`sk_filter`，如下：
 
@@ -1455,6 +1488,209 @@ static inline u8 *bpf_skb_cb(const struct sk_buff *skb)
 ```
 
 eBPF 程序可以读/写`skb->cb[]`区域，在尾部调用之间传输元数据。由于这也需要使用`tc`，因此暂存内存将映射到`qdisc_skb_cb`的数据区域。在某些套接字过滤器的情况下，需要保存/恢复`cb`，保证`skb->cb[]`数据不会丢失。无特权的 eBPF 程序附加到套接字，我们需要清除 `bpf_skb_cb()` 区域，以免将之前的内容泄漏到用户空间。
+
+#### (4) PACKET数据包的过滤过程
+
+##### 1 `packet_rcv_spkt`实现过程
+
+在创建`packet_socket`时，`PACKET`类型设置的`func` 为 `packet_rcv_spkt`，如下：
+
+```C
+// file: net/packet/af_packet.c
+static int packet_create(struct net *net, struct socket *sock, int protocol, int kern)
+{
+    ...
+    // 默认设置
+    po->prot_hook.func = packet_rcv;
+    // SOCK_PACKET类型设置
+    if (sock->type == SOCK_PACKET)
+        po->prot_hook.func = packet_rcv_spkt;
+    ...
+}
+```
+
+`packet_rcv_spkt` 函数使用BPF程序过滤skb，对满足过滤条件的skb添加到接收队列中。如下：
+
+```C
+// file: net/packet/af_packet.c
+static int packet_rcv_spkt(struct sk_buff *skb, struct net_device *dev,
+               struct packet_type *pt, struct net_device *orig_dev)
+{
+    struct sock *sk;
+    struct sockaddr_pkt *spkt;
+
+    sk = pt->af_packet_priv;
+
+    // 跳过发往`loopback`的包
+    if (skb->pkt_type == PACKET_LOOPBACK) goto out;
+
+    // 跳过其他网络命名空间的包
+    if (!net_eq(dev_net(dev), sock_net(sk))) goto out;
+
+    // 检查skb是否共享，共享时复制skb
+    skb = skb_share_check(skb, GFP_ATOMIC);
+    if (skb == NULL) goto oom;
+
+    // 丢弃路由信息
+    skb_dst_drop(skb);
+
+    // 丢弃链接追踪(conntrack)信息
+    nf_reset_ct(skb);
+
+    // 获取spkt地址，恢复skb mac地址信息
+    spkt = &PACKET_SKB_CB(skb)->sa.pkt;
+    skb_push(skb, skb->data - skb_mac_header(skb));
+
+    // 设置spkt信息，接收所有的网络数据包
+    spkt->spkt_family = dev->type;
+    strscpy(spkt->spkt_device, dev->name, sizeof(spkt->spkt_device));
+    spkt->spkt_protocol = skb->protocol;
+
+    // 接收skb，正确接收时返回，否则释放skb
+    if (sock_queue_rcv_skb(sk, skb) == 0)
+        return 0;
+
+out:
+    kfree_skb(skb);
+oom:
+    return 0;
+}
+```
+
+`sock_queue_rcv_skb` 函数调用`sock_queue_rcv_skb_reason`函数接收skb，后者在接收skb时，获取丢弃的原因，如下：
+
+```C
+// file: include/net/sock.h
+static inline int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+{
+    return sock_queue_rcv_skb_reason(sk, skb, NULL);
+}
+// file: net/core/sock.c
+int sock_queue_rcv_skb_reason(struct sock *sk, struct sk_buff *skb, enum skb_drop_reason *reason)
+{
+    enum skb_drop_reason drop_reason;
+    int err;
+
+    // 过滤skb
+    err = sk_filter(sk, skb);
+    if (err) {
+        drop_reason = SKB_DROP_REASON_SOCKET_FILTER;
+        goto out;
+    }
+    err = __sock_queue_rcv_skb(sk, skb);
+    switch (err) {
+    case -ENOMEM:
+        drop_reason = SKB_DROP_REASON_SOCKET_RCVBUFF;
+        break;
+    case -ENOBUFS:
+        drop_reason = SKB_DROP_REASON_PROTO_MEM;
+        break;
+    default:
+        drop_reason = SKB_NOT_DROPPED_YET;
+        break;
+    }
+out:
+    if (reason) *reason = drop_reason;
+    return err;
+}
+```
+
+##### 2 `skb`过滤过程
+
+`sk_filter` 函数实现socket数据包的过滤，调用`sk_filter_trim_cap`函数实现，如下：
+
+```C
+// file: include/linux/filter.h
+static inline int sk_filter(struct sock *sk, struct sk_buff *skb)
+{
+    return sk_filter_trim_cap(sk, skb, 1);
+}
+```
+
+`sk_filter_trim_cap` 函数实现网络数据包的过滤，如下：
+
+```C
+// file: net/core/filter.c
+int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap)
+{
+    int err;
+    struct sk_filter *filter;
+
+    // 检查`pfmemalloc`及标记是否正确
+    if (skb_pfmemalloc(skb) && !sock_flag(sk, SOCK_MEMALLOC)) {
+        NET_INC_STATS(sock_net(sk), LINUX_MIB_PFMEMALLOCDROP);
+        return -ENOMEM;
+    }
+    // CGROUP INGRESS 过滤实现
+    err = BPF_CGROUP_RUN_PROG_INET_INGRESS(sk, skb);
+    if (err) return err;
+
+    // lsm安全检查
+    err = security_sock_rcv_skb(sk, skb);
+    if (err) return err;
+
+    rcu_read_lock();
+    filter = rcu_dereference(sk->sk_filter);
+    if (filter) {
+        struct sock *save_sk = skb->sk;
+        unsigned int pkt_len;
+
+        skb->sk = sk;
+        // 运行bpf程序，保留`skb->cb`信息
+        pkt_len = bpf_prog_run_save_cb(filter->prog, skb);
+        skb->sk = save_sk;
+        // 根据过滤的长度设置返回结果
+        err = pkt_len ? pskb_trim(skb, max(cap, pkt_len)) : -EPERM;
+    }
+    rcu_read_unlock();
+    return err;
+}
+```
+
+##### 3 `skb`接收过程
+
+在经过过滤后，运作通过的skb通过`__sock_queue_rcv_skb`函数存放到接收队列中，如下：
+
+```C
+// file: net/core/sock.c
+int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+{
+    unsigned long flags;
+    struct sk_buff_head *list = &sk->sk_receive_queue;
+
+    // sk接收占用的内存超过接收缓冲区大小时，丢弃
+    if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf) {
+        atomic_inc(&sk->sk_drops);
+        trace_sock_rcvqueue_full(sk, skb);
+        return -ENOMEM;
+    }
+
+    // `sk->sk_forward_alloc`空间不足时，丢弃
+    if (!sk_rmem_schedule(sk, skb, skb->truesize)) {
+        atomic_inc(&sk->sk_drops);
+        return -ENOBUFS;
+    }
+
+    // 设置为接收所有者，过程中增加`sk_rmem_alloc`
+    skb->dev = NULL;
+    skb_set_owner_r(skb, sk);
+
+    // dst存在时，确保正确
+    skb_dst_force(skb);
+
+    spin_lock_irqsave(&list->lock, flags);
+    // 设置丢弃计数
+    sock_skb_set_dropcount(sk, skb);
+    // 添加到sk接收队列中
+    __skb_queue_tail(list, skb);
+    spin_unlock_irqrestore(&list->lock, flags);
+
+    // 通知数据准备完成
+    if (!sock_flag(sk, SOCK_DEAD))
+        sk->sk_data_ready(sk);
+    return 0;
+}
+```
 
 ### 4.4 读取数据的过程
 
@@ -1938,7 +2174,7 @@ static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
 
 #### (2) `packet_sendmsg`实现过程
 
-`AF_PACKET`设置的`ops->sendmsg`接口为`packet_sendmsg`，通过`tpacket_snd`或`packet_snd`发送数据报文，实现如下：
+`SOCK_RAW`对应的ops为`packet_ops`，其设置的`ops->sendmsg`接口为`packet_sendmsg`，通过`tpacket_snd`或`packet_snd`发送数据报文，实现如下：
 
 ```C
 // file: net/packet/af_packet.c
@@ -2065,7 +2301,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
         err = -EMSGSIZE;
         goto out_free;
     }
-    // skb属性检查
+    // skb属性设置
     skb->protocol = proto;
     skb->dev = dev;
     skb->priority = sk->sk_priority;
@@ -2114,6 +2350,121 @@ static int packet_create(struct net *net, struct socket *sock, int protocol, int
     ...
     po->xmit = dev_queue_xmit;
     ...
+}
+```
+
+#### (3) `packet_sendmsg_spkt`实现过程
+
+`SOCK_PACKET`对应的ops为`packet_ops_spkt`，其设置的`ops->sendmsg`接口为`packet_sendmsg_spkt`，实现如下：
+
+```C
+// file: net/packet/af_packet.c
+static int packet_sendmsg_spkt(struct socket *sock, struct msghdr *msg, size_t len)
+{
+    struct sock *sk = sock->sk;
+    DECLARE_SOCKADDR(struct sockaddr_pkt *, saddr, msg->msg_name);
+    struct sk_buff *skb = NULL;
+    struct net_device *dev;
+    ...
+
+    // 检查用户空间设置的addr
+    if (saddr) {
+        if (msg->msg_namelen < sizeof(struct sockaddr)) return -EINVAL;
+        if (msg->msg_namelen == sizeof(struct sockaddr_pkt))
+            proto = saddr->spkt_protocol;
+    } else
+        return -ENOTCONN;
+
+    saddr->spkt_device[sizeof(saddr->spkt_device) - 1] = 0;
+retry:
+    rcu_read_lock();
+    // 根据名称获取网卡设备
+    dev = dev_get_by_name_rcu(sock_net(sk), saddr->spkt_device);
+    // 网卡设备不存在或离线时返回错误
+    err = -ENODEV;
+    if (dev == NULL) goto out_unlock;
+    err = -ENETDOWN;
+    if (!(dev->flags & IFF_UP)) goto out_unlock;
+
+    // 循环冗余校验字段(FCS)支持性检查，长度为4个字节
+    if (unlikely(sock_flag(sk, SOCK_NOFCS))) {
+        if (!netif_supports_nofcs(dev)) {
+            err = -EPROTONOSUPPORT;
+            goto out_unlock;
+        }
+        extra_len = 4; /* We're doing our own CRC */
+    }
+
+    err = -EMSGSIZE;
+    // 检查msg长度是否超过网络包长度
+    if (len > dev->mtu + dev->hard_header_len + VLAN_HLEN + extra_len)
+        goto out_unlock;
+
+    if (!skb) {
+        size_t reserved = LL_RESERVED_SPACE(dev);
+        int tlen = dev->needed_tailroom;
+        unsigned int hhlen = dev->header_ops ? dev->hard_header_len : 0;
+
+        rcu_read_unlock();
+        // 创建skb
+        skb = sock_wmalloc(sk, len + reserved + tlen, 0, GFP_KERNEL);
+        if (skb == NULL) return -ENOBUFS;
+        // 设置skb预留长度
+        skb_reserve(skb, reserved);
+        skb_reset_network_header(skb);
+
+        // 对齐硬件头部长度
+        if (hhlen) {
+            skb->data -= hhlen;
+            skb->tail -= hhlen;
+            if (len < hhlen) skb_reset_network_header(skb);
+        }
+        // 拷贝msg内存到skb
+        err = memcpy_from_msg(skb_put(skb, len), msg, len);
+        if (err) goto out_free;
+        goto retry;
+    }
+
+    // 检查skb头部是否正确，skb长度是否正确
+    if (!dev_validate_header(dev, skb->data, len) || !skb->len) {
+        err = -EINVAL;
+        goto out_unlock;
+    }
+    if (len > (dev->mtu + dev->hard_header_len + extra_len) &&
+        !packet_extra_vlan_len_allowed(dev, skb)) {
+        err = -EMSGSIZE;
+        goto out_unlock;
+    }
+    // 获取cmsg，设置sk相关参数
+    sockcm_init(&sockc, sk);
+    if (msg->msg_controllen) {
+        err = sock_cmsg_send(sk, msg, &sockc);
+        if (unlikely(err)) goto out_unlock;
+    }
+    // skb属性设置
+    skb->protocol = proto;
+    skb->dev = dev;
+    skb->priority = sk->sk_priority;
+    skb->mark = sk->sk_mark;
+    skb->tstamp = sockc.transmit_time;
+    // 设置TX发送时间戳
+    skb_setup_tx_timestamp(skb, sockc.tsflags);
+    // no_fcs设置
+    if (unlikely(extra_len == 4)) skb->no_fcs = 1;
+
+    // 解析头部信息，`SOCK_RAW:ETH_P_ALL`模式下获取`protocol`, VLAN网络包移动头部到正确的位置
+    packet_parse_headers(skb, sock);
+
+    // 网卡设备发送skb
+    dev_queue_xmit(skb);
+    rcu_read_unlock();
+    return len;
+
+out_unlock:
+    rcu_read_unlock();
+out_free:
+    kfree_skb(skb);
+    return err;
 }
 ```
 
@@ -3048,7 +3399,6 @@ static void packet_sock_destruct(struct sock *sk)
 ## 5 总结
 
 本文通过`sockfilter`示例程序分析了Linux内核使用BPF对抓包过滤的实现过程，在此基础上分析了用户空间在进行网络操作时Linux内核内部的实现过程。
-
 
 ## 参考资料
 
