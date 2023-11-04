@@ -6,8 +6,7 @@
 
 ## 1 简介
 
-SK_LOOKUP类型(BPF_PROG_TYPE_SK_LOOKUP)的程序将可编程性引入到本地传送数据包时查找socket过程中，解决无法绑定地址或端口的情况，如：
-因端口冲突导致`INADRR_ANY`不可用的情况，或者L7代理在所有或大范围端口接收连接的情况。
+SK_LOOKUP类型(BPF_PROG_TYPE_SK_LOOKUP)的程序将可编程性引入到本地传送数据包时查找socket过程中，解决无法绑定地址或端口的情况，如：因端口冲突导致`INADRR_ANY`不可用的情况，或者L7代理在所有或大范围端口接收连接的情况。
 
 ## 2 `sk_lookup`示例程序
 
@@ -74,6 +73,7 @@ static int attach_reuseport(int sock_fd, struct bpf_program *reuseport_prog)
 `sk_lookup`程序是Linux内核自带的测试程序，在`tools/testing/selftests/bpf/prog_tests/`目录下。编译后运行，如下：
 
 ```bash
+$ cd tools/testing/selftests/bpf/
 $ sudo make
 $ sudo ./test_progs -t sk_lookup -vvv
 bpf_testmod.ko is already unloaded.
