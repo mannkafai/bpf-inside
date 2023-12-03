@@ -774,7 +774,7 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 }
 ```
 
-`cgroup_bpf_prog_detach` 函数获取bpf程序和cgroup后，分类程序，实现如下：
+`cgroup_bpf_prog_detach` 函数获取bpf程序和cgroup分离程序，实现如下：
 
 ```C
 // file: kernel/bpf/cgroup.c
@@ -795,6 +795,7 @@ int cgroup_bpf_prog_detach(const union bpf_attr *attr, enum bpf_prog_type ptype)
 
     cgroup_put(cgrp);
     return ret;
+}
 ```
 
 #### 2 Link方式
