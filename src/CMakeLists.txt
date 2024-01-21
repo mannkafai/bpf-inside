@@ -79,7 +79,7 @@ file(GLOB helpers *_helpers.c)
 add_library(helper STATIC ${helpers})
 target_include_directories(helper PRIVATE ${LIBBPF_INCLUDE_DIRS})
 
-set(BZ_APPS profile)
+set(BZ_APPS profile  data_breakpoint)
 
 # Create an executable for each application
 file(GLOB apps *.bpf.c)
