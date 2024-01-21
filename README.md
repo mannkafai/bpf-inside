@@ -27,6 +27,7 @@
 * [21-SOCKMAP的内核实现](doc/21-sockmap.md)
 * [22-LIRC_MODE2的内核实现](doc/22-lirc_mode2.md)
 * [23-BPF_ITER的内核实现](doc/23-bpf_iter.md)
+* [24-BREAKPOINT-PMU的内核实现](doc/24-hw-breakpoint.md)
 
 ## 编译示例
 
