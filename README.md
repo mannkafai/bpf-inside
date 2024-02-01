@@ -30,6 +30,7 @@
 * [24-BREAKPOINT-PMU的内核实现](doc/24-hw-breakpoint.md)
 * [25-NETFILTER_LINK的内核实现](doc/25-netfilter_link.md)
 * [26-UPROBE.MULTI的内核实现](doc/26-uprobe_multi.md)
+* [27-TC EXPRESS的内核实现](doc/27-tc_express.md)
 
 ## 编译示例
 
