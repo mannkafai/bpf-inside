@@ -32,6 +32,7 @@
 * [26-UPROBE.MULTI的内核实现](doc/26-uprobe_multi.md)
 * [27-TC EXPRESS的内核实现](doc/27-tc_express.md)
 * [28-NETKIT的内核实现](doc/28-netkit.md)
+* [29-TEST RUN的内核实现](doc/29-test_run.md)
 
 ## 编译示例
 
