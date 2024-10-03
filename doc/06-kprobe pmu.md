@@ -1781,7 +1781,9 @@ static int arm_kprobe(struct kprobe *kp)
 }
 ```
 
-`arm_kprobe` 根据`kprobe`是否为`ftrace`进行不同的设置，是`ftrace`时(我们使用的场景)，调用 `arm_kprobe_ftrace` 函数开启`kprobe_ftrace`事件。实现如下：
+###### `ftrace`情况下的开启过程
+
+`arm_kprobe` 根据`kprobe`是否为`ftrace`进行不同的设置。`ftrace`情况下(函数入口)时，调用 `arm_kprobe_ftrace` 函数开启`kprobe_ftrace`事件。实现如下：
 
 ```C
 // file: kernel/kprobes.c
@@ -2050,6 +2052,44 @@ SYM_FUNC_END(ftrace_regs_caller)
 STACK_FRAME_NON_STANDARD_FP(ftrace_regs_caller)
 ```
 
+###### 默认情况下的开启过程
+
+在不是`ftrace`情况下，调用`__arm_kprobe`函数，通过设置断点来开启`kprobe`。实现如下：
+
+```C
+// file: kernel/kprobes.c
+static void __arm_kprobe(struct kprobe *p)
+{
+    struct kprobe *_p;
+    lockdep_assert_held(&text_mutex);
+
+    // 查找优化的地址
+    _p = get_optimized_kprobe(p->addr);
+    if (unlikely(_p))
+        unoptimize_kprobe(_p, true);
+
+    // 平台架构下设置断点
+    arch_arm_kprobe(p);
+    // 尝试优化kprobe
+    optimize_kprobe(p);	/* Try to optimize (add kprobe to a list) */
+}
+```
+
+我们略过优化过程，只关注kprobe的开启过程。在`x86`架构下，通过`int3`指令设置断点，`arch_arm_kprobe` 实现如下：
+
+```C
+// file: arch/x86/kernel/kprobes/core.c
+void arch_arm_kprobe(struct kprobe *p)
+{
+    u8 int3 = INT3_INSN_OPCODE;
+    // 修改`kprobe`指令，设置为`int3`
+    text_poke(p->addr, &int3, 1);
+    text_poke_sync();
+    // 记录`kprobe`地址的原始指令
+    perf_event_text_poke(p->addr, &p->opcode, 1, &int3, 1);
+}
+```
+
 ##### （2）kretprobe的开启过程
 
 `enable_kretprobe` 函数同样开启`kprobe`, 实现如下：
@@ -2164,7 +2204,9 @@ static int disarm_kprobe(struct kprobe *kp, bool reopt)
 }
 ```
 
-和`arm_kprobe`一样，`disarm_kprobe` 根据`kprobe`是否为`ftrace`进行不同的设置，是`ftrace`时(我们使用的场景)，调用 `disarm_kprobe_ftrace` 函数禁用`kprobe_ftrace`事件。实现如下：
+###### `ftrace`情况下的禁用过程
+
+和`arm_kprobe`一样，`disarm_kprobe` 根据`kprobe`是否为`ftrace`进行不同的设置，`ftrace`情况下(函数入口)时，调用 `disarm_kprobe_ftrace` 函数禁用`kprobe_ftrace`事件。实现如下：
 
 ```C
 // file: kernel/kprobes.c
@@ -2230,6 +2272,46 @@ static int __disarm_kprobe_ftrace(struct kprobe *p, struct ftrace_ops *ops, int 
                 --> ftrace_hash_move_and_update_ops(ops, orig_hash, hash, enable);
 ```
 
+###### 默认情况下的禁用过程
+
+在不是`ftrace`情况下，调用`__disarm_kprobe`函数，通过删除断点来禁用`kprobe`。实现如下：
+
+```C
+// file: kernel/kprobes.c
+static void __disarm_kprobe(struct kprobe *p, bool reopt)
+{
+    struct kprobe *_p;
+    lockdep_assert_held(&text_mutex);
+
+    // 尝试取消优化
+    unoptimize_kprobe(p, kprobes_all_disarmed);
+
+    if (!kprobe_queued(p)) {
+        // 删除断点
+        arch_disarm_kprobe(p);
+        // 有其他的kprobe，重新优化
+        _p = get_optimized_kprobe(p->addr);
+        if (unlikely(_p) && reopt)
+            optimize_kprobe(_p);
+    }
+}
+```
+
+我们略过优化过程，只关注kprobe的禁用过程。在`x86`架构下，通过恢复原始指令来禁用，`arch_disarm_kprobe` 函数实现该功能，如下：
+
+```C
+// file: arch/x86/kernel/kprobes/core.c
+void arch_disarm_kprobe(struct kprobe *p)
+{
+    u8 int3 = INT3_INSN_OPCODE;
+    // 获取原始指令
+    perf_event_text_poke(p->addr, &int3, 1, &p->opcode, 1);
+    // 修改`kprobe`地址的指令，修改为之前的指令
+    text_poke(p->addr, &p->opcode, 1);
+    text_poke_sync();
+}
+```
+
 ##### （2）kretprobe的禁用过程
 
 `disable_kretprobe` 函数同样禁用`kprobe`, 实现如下：
@@ -2282,7 +2364,9 @@ unlock:
 
 ### 4.5 kprobe的触发过程
 
-#### 1 触发`ftrace_handler`
+#### 1 调用探测函数时触发`handler` 
+
+##### (1) `ftrace`情况下触发`ftrace_handler`
 
 在内核调用我们探测的函数时，进入设置的蹦床中执行。在蹦床中调用设置的 `kprobe_ftrace_handler` 函数。后者实现如下：
 
@@ -2333,6 +2417,139 @@ void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 out:
     // 清除递归调用标记
     ftrace_test_recursion_unlock(bit);
+}
+```
+
+##### (2) 默认情况下触发`INT3`中断
+
+在启动过程设置中断处理接口，`INT3`中断设置如下：
+
+```C
+// file: arch/x86/entry/entry_64.S
+//idtentry宏定义
+.macro idtentry vector asmsym cfunc has_error_code:req
+SYM_CODE_START(\asmsym)
+    --> ...
+    --> call	\cfunc
+    --> ...
+
+// int3 中断设置
+// file: arch/x86/include/asm/idtentry.h
+DECLARE_IDTENTRY_RAW(X86_TRAP_BP,		exc_int3);
+```
+
+`X86_TRAP_BP` 中断处理函数为 `asm_exc_int3`， 在其中调用 `exc_int3` C函数。实现如下： 
+
+```C
+// file: arch/x86/kernel/traps.c
+DEFINE_IDTENTRY_RAW(exc_int3)
+{
+    if (user_mode(regs)) {
+        irqentry_enter_from_user_mode(regs);
+        instrumentation_begin();
+        // 用户空间`int3`处理
+        do_int3_user(regs);
+        instrumentation_end();
+        // 退出到用户态
+        irqentry_exit_to_user_mode(regs);
+    } else {
+        irqentry_state_t irq_state = irqentry_nmi_enter(regs);
+        instrumentation_begin();
+        // 内核空间`int3`处理
+        if (!do_int3(regs))
+            die("int3", regs, 0);
+        instrumentation_end();
+        irqentry_nmi_exit(regs, irq_state);
+    }
+}
+```
+
+内核空间中调用 `do_int3` 函数，该函数中处理`kprobe`，如下：
+
+```C
+// file: arch/x86/kernel/traps.c
+static bool do_int3(struct pt_regs *regs)
+{
+    int res;
+    ...
+#ifdef CONFIG_KPROBES
+    if (kprobe_int3_handler(regs))
+        return true;
+#endif
+    res = notify_die(DIE_INT3, "int3", regs, 0, X86_TRAP_BP, SIGTRAP);
+    return res == NOTIFY_STOP;
+}
+```
+
+`kprobe_int3_handler`函数通过单步调试模式，触发设置的`kprobe`，实现如下：
+
+```C
+// file: arch/x86/kernel/kprobes/core.c
+int kprobe_int3_handler(struct pt_regs *regs)
+{
+    kprobe_opcode_t *addr;
+    struct kprobe *p;
+    struct kprobe_ctlblk *kcb;
+
+    // 用户空间地址直接返回
+    if (user_mode(regs)) return 0;
+
+    // 获取`kprobe`地址
+    addr = (kprobe_opcode_t *)(regs->ip - sizeof(kprobe_opcode_t));
+    // 获取`kcb`和改地址下的`kprobe`
+    kcb = get_kprobe_ctlblk();
+    p = get_kprobe(addr);
+
+    if (p) {
+        if (kprobe_running()) {
+            // `kprobe`正在运行时，重新进入`kprobe`
+            if (reenter_kprobe(p, regs, kcb)) return 1;
+        } else {
+            // 设置`kcb`状态
+            set_current_kprobe(p, regs, kcb);
+            kcb->kprobe_status = KPROBE_HIT_ACTIVE;
+
+            // 调用`kprobe`的`pre_handler`
+            if (!p->pre_handler || !p->pre_handler(p, regs))
+                // 设置单步调试
+                setup_singlestep(p, regs, kcb, 0);
+            else
+                reset_current_kprobe();
+            return 1;
+        }
+    } else if (kprobe_is_ss(kcb)) {
+        // 获取正在执行的`kprobe`
+        p = kprobe_running();
+        if ((unsigned long)p->ainsn.insn < regs->ip &&
+            (unsigned long)p->ainsn.insn + MAX_INSN_SIZE > regs->ip) {
+            /* Most provably this is the second int3 for singlestep */
+            resume_singlestep(p, regs, kcb);
+            // 执行`post_handler`
+            kprobe_post_process(p, regs, kcb);
+            return 1;
+        }
+    } 
+    return 0;
+}
+```
+
+`kprobe_post_process`函数检查并执行`post_handler`，如下：
+
+```C
+// file: arch/x86/kernel/kprobes/core.c
+static void kprobe_post_process(struct kprobe *cur, struct pt_regs *regs, struct kprobe_ctlblk *kcb)
+{
+    // 恢复之前保存的`kprobes`
+    if (kcb->kprobe_status == KPROBE_REENTER) {
+        // 恢复`kcb`和`kprobe`
+        restore_previous_kprobe(kcb);
+    } else {
+        // 更新`kcb`状态，检查并调用`post_handler`
+        kcb->kprobe_status = KPROBE_HIT_SSDONE;
+        if (cur->post_handler)
+            cur->post_handler(cur, regs, 0);
+        reset_current_kprobe();
+    }
 }
 ```
 
