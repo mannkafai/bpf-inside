@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <getopt.h> 
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -34,9 +35,34 @@ static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid, int cpu
 
 static struct blaze_symbolizer *symbolizer;
 
+static void print_frame(const char *name, uintptr_t input_addr, uintptr_t addr, uint64_t offset, const blaze_symbolize_code_info* code_info)
+{
+    // If we have an input address  we have a new symbol.
+    if (input_addr != 0) {
+      printf("%016lx: %s @ 0x%lx+0x%lx", input_addr, name, addr, offset);
+			if (code_info != NULL && code_info->dir != NULL && code_info->file != NULL) {
+				printf(" %s/%s:%u\n", code_info->dir, code_info->file, code_info->line);
+      } else if (code_info != NULL && code_info->file != NULL) {
+				printf(" %s:%u\n", code_info->file, code_info->line);
+      } else {
+				printf("\n");
+      }
+    } else {
+      printf("%16s  %s", "", name);
+			if (code_info != NULL && code_info->dir != NULL && code_info->file != NULL) {
+				printf("@ %s/%s:%u [inlined]\n", code_info->dir, code_info->file, code_info->line);
+      } else if (code_info != NULL && code_info->file != NULL) {
+				printf("@ %s:%u [inlined]\n", code_info->file, code_info->line);
+      } else {
+				printf("[inlined]\n");
+      }
+    }
+}
+
 static void show_stack_trace(__u64 *stack, int stack_sz, pid_t pid)
 {
-	const struct blaze_result *result;
+  const struct blaze_symbolize_inlined_fn* inlined;
+	const struct blaze_syms *syms;
 	const struct blaze_sym *sym;
 	int i, j;
 
@@ -44,48 +70,38 @@ static void show_stack_trace(__u64 *stack, int stack_sz, pid_t pid)
 
 	if (pid) {
 		struct blaze_symbolize_src_process src = {
+			.type_size = sizeof(src),
 			.pid = pid,
 		};
-		result = blaze_symbolize_process(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+		syms = blaze_symbolize_process_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
 	} else {
-		struct blaze_symbolize_src_kernel src = {};
-		result = blaze_symbolize_kernel(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+		struct blaze_symbolize_src_kernel src = {
+			.type_size = sizeof(src),
+		};
+		syms = blaze_symbolize_kernel_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
 	}
 
+	if (syms == NULL) {
+		printf("  failed to symbolize addresses: %s\n", blaze_err_str(blaze_err_last()));
+		return;
+	}
 
 	for (i = 0; i < stack_sz; i++) {
-		if (!result || result->size <= i || !result->entries[i].size) {
-			printf("  %d [<%016llx>]\n", i, stack[i]);
+		if (!syms || syms->cnt <= i || syms->syms[i].name == NULL) {
+			printf("%016llx: <no-symbol>\n", stack[i]);
 			continue;
 		}
 
-		if (result->entries[i].size == 1) {
-			sym = &result->entries[i].syms[0];
-			if (sym->path && sym->path[0]) {
-				printf("  %d [<%016llx>] %s+0x%llx %s:%ld\n", i, stack[i],
-				       sym->symbol, stack[i] - sym->addr, sym->path,
-				       sym->line);
-			} else {
-				printf("  %d [<%016llx>] %s+0x%llx\n", i, stack[i], sym->symbol,
-				       stack[i] - sym->addr);
-			}
-			continue;
-		}
+    sym = &syms->syms[i];
+    print_frame(sym->name, stack[i], sym->addr, sym->offset, &sym->code_info);
 
-		printf("  %d [<%016llx>]\n", i, stack[i]);
-		for (j = 0; j < result->entries[i].size; j++) {
-			sym = &result->entries[i].syms[j];
-			if (sym->path && sym->path[0]) {
-				printf("        %s+0x%llx %s:%ld\n", sym->symbol,
-				       stack[i] - sym->addr, sym->path, sym->line);
-			} else {
-				printf("        %s+0x%llx\n", sym->symbol,
-				       stack[i] - sym->addr);
-			}
-		}
+    for (j = 0; j < sym->inlined_cnt; j++) {
+      inlined = &sym->inlined[j];
+      print_frame(sym->name, 0, 0, 0, &inlined->code_info);
+    }
 	}
 
-	blaze_result_free(result);
+	blaze_syms_free(syms);
 }
 
 /* Receive events from the ring buffer. */
@@ -118,13 +134,17 @@ static int event_handler(void *_ctx, void *data, size_t size)
 
 static void show_help(const char *progname)
 {
-	printf("Usage: %s [-f <frequency>] [-h]\n", progname);
+	printf("Usage: %s [-f <frequency>] [--sw-event] [-h]\n", progname);
+	printf("Options:\n");
+	printf("  -f <frequency>  Sampling frequency [default: 1]\n");
+	printf("  --sw-event      Use software event for triggering stack trace capture\n");
+	printf("  -h              Print help\n");
 }
 
 int main(int argc, char *const argv[])
 {
 	const char *online_cpus_file = "/sys/devices/system/cpu/online";
-	int freq = 1, pid = -1, cpu;
+	int freq = 1, sw_event = 0, pid = -1, cpu;
 	struct profile_bpf *skel = NULL;
 	struct perf_event_attr attr;
 	struct bpf_link **links = NULL;
@@ -134,12 +154,20 @@ int main(int argc, char *const argv[])
 	int argp, i, err = 0;
 	bool *online_mask = NULL;
 
-	while ((argp = getopt(argc, argv, "hf:")) != -1) {
+	static struct option long_options[] = {
+		{"sw-event", no_argument, 0, 's'},
+		{0, 0, 0, 0}
+	};
+
+	while ((argp = getopt_long(argc, argv, "hf:", long_options, NULL)) != -1) {
 		switch (argp) {
 		case 'f':
 			freq = atoi(optarg);
 			if (freq < 1)
 				freq = 1;
+			break;
+		case 's':
+			sw_event = 1;
 			break;
 
 		case 'h':
@@ -191,9 +219,9 @@ int main(int argc, char *const argv[])
 	links = calloc(num_cpus, sizeof(struct bpf_link *));
 
 	memset(&attr, 0, sizeof(attr));
-	attr.type = PERF_TYPE_HARDWARE;
+	attr.type = sw_event ? PERF_TYPE_SOFTWARE : PERF_TYPE_HARDWARE;
 	attr.size = sizeof(attr);
-	attr.config = PERF_COUNT_HW_CPU_CYCLES;
+	attr.config = sw_event ? PERF_COUNT_SW_CPU_CLOCK : PERF_COUNT_HW_CPU_CYCLES;
 	attr.sample_freq = freq;
 	attr.freq = 1;
 
@@ -205,7 +233,13 @@ int main(int argc, char *const argv[])
 		/* Set up performance monitoring on a CPU/Core */
 		pefd = perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		if (pefd < 0) {
-			fprintf(stderr, "Fail to set up performance monitor on a CPU/Core\n");
+			if (!sw_event && errno == ENOENT) {
+				fprintf(stderr,
+					"Fail to set up performance monitor on a CPU/Core.\n"
+					"Try running the profile example with the `--sw-event` option.\n");
+			} else {
+				fprintf(stderr, "Fail to set up performance monitor on a CPU/Core.\n");
+			}
 			err = -1;
 			goto cleanup;
 		}

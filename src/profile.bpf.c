@@ -17,14 +17,17 @@ struct {
 SEC("perf_event")
 int profile(void *ctx)
 {
+	int pid = bpf_get_current_pid_tgid() >> 32;
+	int cpu_id = bpf_get_smp_processor_id();
 	struct stacktrace_event *event;
+	int cp;
 
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 1;
 
-	event->pid = bpf_get_current_pid_tgid() >> 32;;
-	event->cpu_id = bpf_get_smp_processor_id();;
+	event->pid = pid;
+	event->cpu_id = cpu_id;
 
 	if (bpf_get_current_comm(event->comm, sizeof(event->comm)))
 		event->comm[0] = 0;

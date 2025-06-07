@@ -43,7 +43,7 @@ if(CARGO_EXISTS)
     PREFIX blazesym
     SOURCE_DIR ${PROJECT_ROOT}/blazesym
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND cargo build --release
+    BUILD_COMMAND cargo build --package=blazesym-c --release
     BUILD_IN_SOURCE TRUE
     INSTALL_COMMAND ""
     STEP_TARGETS build
@@ -69,7 +69,7 @@ elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
 endif()
 
 set(BPFOBJECT_BPFTOOL_EXE ${CMAKE_CURRENT_BINARY_DIR}/bpftool/bootstrap/bpftool)
-set(BPFOBJECT_VMLINUX_H ${PROJECT_ROOT}/vmlinux/${ARCH}/vmlinux.h)
+set(BPFOBJECT_VMLINUX_H ${PROJECT_ROOT}/vmlinux.h/include/${ARCH}/vmlinux.h)
 set(LIBBPF_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}/libbpf)
 set(LIBBPF_LIBRARIES ${CMAKE_CURRENT_BINARY_DIR}/libbpf/libbpf.a)
 find_package(BpfObject REQUIRED)
@@ -104,6 +104,6 @@ if(CARGO_EXISTS)
     target_include_directories(${app_stem} PRIVATE
       ${PROJECT_ROOT}/blazesym/include)
     target_link_libraries(${app_stem}
-      ${PROJECT_ROOT}/blazesym/target/release/libblazesym.a -lpthread -lrt -ldl)
+      ${PROJECT_ROOT}/blazesym/target/release/libblazesym_c.a -lpthread -lrt -ldl)
   endforeach()
 endif()

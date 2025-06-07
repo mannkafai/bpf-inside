@@ -6,6 +6,25 @@
 #include <bpf/bpf_tracing.h>
 #include "runqlen.h"
 
+/**
+ * commit 736c55a02c47 ("sched/fair: Rename cfs_rq.nr_running into nr_queued")
+ * renamed cfs_rq::nr_running to cfs_rq::nr_queued.
+ *
+ * References:
+ *   [0]: https://github.com/torvalds/linux/commit/736c55a02c47
+ */
+struct cfs_rq___pre_v614 {
+	unsigned int		nr_running;
+};
+
+static __always_inline __u8 cfs_rq_get_nr_running_or_nr_queued(void *cfs_rq)
+{
+	if (bpf_core_field_exists(struct cfs_rq___pre_v614, nr_running))
+		return BPF_CORE_READ((struct cfs_rq___pre_v614 *)cfs_rq, nr_running);
+
+	return BPF_CORE_READ((struct cfs_rq *)cfs_rq, nr_queued);
+}
+
 const volatile bool targ_per_cpu = false;
 const volatile bool targ_host = false;
 
@@ -22,7 +41,7 @@ int do_sample(struct bpf_perf_event_data *ctx)
 	if (targ_host)
 		slot = BPF_CORE_READ(task, se.cfs_rq, rq, nr_running);
 	else
-		slot = BPF_CORE_READ(task, se.cfs_rq, nr_running);
+		slot = cfs_rq_get_nr_running_or_nr_queued(BPF_CORE_READ(task, se.cfs_rq));
 	/*
 	 * Calculate run queue length by subtracting the currently running task,
 	 * if present. len 0 == idle, len 1 == one running task.
