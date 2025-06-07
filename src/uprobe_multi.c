@@ -152,5 +152,6 @@ int main(int argc, char **argv)
 	opts.syms = syms;
 	opts.cnt = ARRAY_SIZE(syms);
 	test_attach_api("/proc/self/exe", NULL, &opts, NULL);
+	printf("PASSED\n");
 	return 0;
 }

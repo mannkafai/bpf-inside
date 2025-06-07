@@ -108,11 +108,8 @@ $ sudo ./uprobe_multi
 libbpf: loading object 'uprobe_multi_bpf' from buffer
 ...
 libbpf: map '.rodata.str1.1': created successfully, fd=4
-libbpf: prog 'uprobe': failed to attach multi-uprobe: Invalid argument
-...
+PASSED
 ```
-
-由于`uprobe.multi`在Linux v6.6内核中添加的，目前使用的是Linux v6.5，因此运行失败。
 
 ## 3 uprobe_multi附加BPF的过程
 
@@ -122,15 +119,17 @@ libbpf: prog 'uprobe': failed to attach multi-uprobe: Invalid argument
 // file: libbpf/src/libbpf.c
 static const struct bpf_sec_def section_defs[] = {
     ...
-    SEC_DEF("uprobe.multi+", KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_NONE, attach_uprobe_multi),
+    SEC_DEF("uprobe.multi+",    KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_NONE, attach_uprobe_multi),
     SEC_DEF("uretprobe.multi+", KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_NONE, attach_uprobe_multi),
-    SEC_DEF("uprobe.multi.s+", KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
-    SEC_DEF("uretprobe.multi.s+", KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
+    SEC_DEF("uprobe.session+",  KPROBE, BPF_TRACE_UPROBE_SESSION, SEC_NONE, attach_uprobe_multi),
+    SEC_DEF("uprobe.multi.s+",  KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
+    SEC_DEF("uretprobe.multi.s+",   KPROBE, BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
+    SEC_DEF("uprobe.session.s+",    KPROBE, BPF_TRACE_UPROBE_SESSION, SEC_SLEEPABLE, attach_uprobe_multi),
     ...
 };
 ```
 
-`uprobe.multi` 和 `uretprobe.multi` 都是通过 `attach_uprobe_multi` 函数进行附加的。用户可通过 `bpf_program__attach_uprobe_multi` 手动附加。
+`uprobe.multi`，`uretprobe.multi` 和 `uprobe.session` 是通过 `attach_uprobe_multi` 函数进行附加的。用户可通过 `bpf_program__attach_uprobe_multi` 手动附加。
 
 `attach_uprobe_multi` 在解析SEC名称中`pattern`后，调用 `bpf_program__attach_uprobe_multi` 函数完成剩余的工作。实现过程如下：
 
@@ -152,7 +151,8 @@ static int attach_uprobe_multi(const struct bpf_program *prog, long cookie, stru
         break;
     case 3:
         // 格式正确，自动附加BPF程序
-        opts.retprobe = strcmp(probe_type, "uretprobe.multi") == 0;
+        opts.session = str_has_pfx(probe_type, "uprobe.session");
+        opts.retprobe = str_has_pfx(probe_type, "uretprobe.multi");
         *link = bpf_program__attach_uprobe_multi(prog, -1, binary_path, func_name, &opts);
         ret = libbpf_get_error(*link);
         break;
@@ -182,12 +182,17 @@ bpf_program__attach_uprobe_multi(const struct bpf_program *prog, pid_t pid, cons
 
     if (!OPTS_VALID(opts, bpf_uprobe_multi_opts)) return libbpf_err_ptr(-EINVAL);
 
+    prog_fd = bpf_program__fd(prog);
+    if (prog_fd < 0) { ... }
+
     // 获取opts设置的参数
     syms = OPTS_GET(opts, syms, NULL);
     offsets = OPTS_GET(opts, offsets, NULL);
     ref_ctr_offsets = OPTS_GET(opts, ref_ctr_offsets, NULL);
     cookies = OPTS_GET(opts, cookies, NULL);
     cnt = OPTS_GET(opts, cnt, 0);
+    retprobe = OPTS_GET(opts, retprobe, false);
+    session  = OPTS_GET(opts, session, false);
 
     // opts参数和pattern兼容性检查
     if (!path) return libbpf_err_ptr(-EINVAL);
@@ -217,13 +222,16 @@ bpf_program__attach_uprobe_multi(const struct bpf_program *prog, pid_t pid, cons
         offsets = resolved_offsets;
     }
 
+    // 判断附加类型
+    attach_type = session ? BPF_TRACE_UPROBE_SESSION : BPF_TRACE_UPROBE_MULTI;
+
     // 设置`uprobe_multi`属性
     lopts.uprobe_multi.path = path;
     lopts.uprobe_multi.offsets = offsets;
     lopts.uprobe_multi.ref_ctr_offsets = ref_ctr_offsets;
     lopts.uprobe_multi.cookies = cookies;
     lopts.uprobe_multi.cnt = cnt;
-    lopts.uprobe_multi.flags = OPTS_GET(opts, retprobe, false) ? BPF_F_UPROBE_MULTI_RETURN : 0;
+    lopts.uprobe_multi.flags = retprobe ? BPF_F_UPROBE_MULTI_RETURN : 0;
 
     // pid设置
     if (pid == 0) pid = getpid();
@@ -235,7 +243,6 @@ bpf_program__attach_uprobe_multi(const struct bpf_program *prog, pid_t pid, cons
     link->detach = &bpf_link__detach_fd;
 
     // 获取bpf程序fd后，创建link
-    prog_fd = bpf_program__fd(prog);
     link_fd = bpf_link_create(prog_fd, 0, BPF_TRACE_UPROBE_MULTI, &lopts);
     if (link_fd < 0) { ... }
     link->fd = link_fd;
@@ -285,6 +292,7 @@ int bpf_link_create(int prog_fd, int target_fd, enum bpf_attach_type attach_type
     switch (attach_type) {
     ...
     case BPF_TRACE_UPROBE_MULTI:
+    case BPF_TRACE_UPROBE_SESSION:
         // 设置`uprobe_multi`属性
         attr.link_create.uprobe_multi.flags = OPTS_GET(opts, uprobe_multi.flags, 0);
         attr.link_create.uprobe_multi.cnt = OPTS_GET(opts, uprobe_multi.cnt, 0);
@@ -339,7 +347,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 
 #### 2 `BPF_LINK_CREATE`
 
-`link_create` 在检查BFP程序类型和attr属性中附加类型匹配后，针对不同程序类型和附加类型进行不同的处理。 `uprobe.multi` 和 `uretprobe.multi` 设置的程序类型为`BPF_PROG_TYPE_KPROBE`, 附加类型为`BPF_TRACE_UPROBE_MULTI`, 对应 `bpf_uprobe_multi_link_attach` 处理函数。如下：
+`link_create` 在检查BFP程序类型和attr属性中附加类型匹配后，针对不同程序类型和附加类型进行不同的处理。 `uprobe.multi` 和 `uretprobe.multi` 设置的程序类型为`BPF_PROG_TYPE_KPROBE`, 附加类型为`BPF_TRACE_UPROBE_MULTI`. `uprobe.session` 设置的程序类型为`BPF_PROG_TYPE_KPROBE`, 附加类型为`BPF_TRACE_UPROBE_SESSION`, 这两种附加类型都对应 `bpf_uprobe_multi_link_attach` 处理函数。如下：
 
 ```C
 // file: kernel/bpf/syscall.c
@@ -357,11 +365,9 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
     switch (prog->type) {
     ...
     case BPF_PROG_TYPE_KPROBE:
-        if (attr->link_create.attach_type == BPF_PERF_EVENT)
-            ret = bpf_perf_link_attach(attr, prog);
-        else if (attr->link_create.attach_type == BPF_TRACE_KPROBE_MULTI)
-            ret = bpf_kprobe_multi_link_attach(attr, prog);
-        else if (attr->link_create.attach_type == BPF_TRACE_UPROBE_MULTI)
+        ...
+        else if (attr->link_create.attach_type == BPF_TRACE_UPROBE_MULTI ||
+             attr->link_create.attach_type == BPF_TRACE_UPROBE_SESSION)
             // uprobe_multi_link处理
             ret = bpf_uprobe_multi_link_attach(attr, prog);
         break;
@@ -388,8 +394,10 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
     // `uprobe_multi` 不支持32位系统
     if (sizeof(u64) != sizeof(void *)) return -EOPNOTSUPP;
-
-    if (prog->expected_attach_type != BPF_TRACE_UPROBE_MULTI) return -EINVAL;
+    // 不支持创建时设置flags
+    if (attr->link_create.flags) return -EINVAL;
+    // 检查是否是 `uprobe_multi`，附加类型为 `BPF_TRACE_UPROBE_MULTI` 或 `BPF_TRACE_UPROBE_SESSION`
+    if (!is_uprobe_multi(prog)) return -EINVAL;
 
     // 用户参数检查，只支持 `UPROBE_MULTI_RETURN` 标记设置
     flags = attr->link_create.uprobe_multi.flags;
@@ -399,7 +407,11 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
     upath = u64_to_user_ptr(attr->link_create.uprobe_multi.path);
     uoffsets = u64_to_user_ptr(attr->link_create.uprobe_multi.offsets);
     cnt = attr->link_create.uprobe_multi.cnt;
-    if (!upath || !uoffsets || !cnt) return -EINVAL;
+    pid = attr->link_create.uprobe_multi.pid;
+    // 检查用户空间设置的参数
+    if (!upath || !uoffsets || !cnt || pid < 0) return -EINVAL;
+    if (cnt > MAX_UPROBE_MULTI_CNT) return -E2BIG;
+    
     // `ref_ctr_offsets`和`cookies`参数
     uref_ctr_offsets = u64_to_user_ptr(attr->link_create.uprobe_multi.ref_ctr_offsets);
     ucookies = u64_to_user_ptr(attr->link_create.uprobe_multi.cookies);
@@ -414,10 +426,9 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
     if (!d_is_reg(path.dentry)) { ... }
 
     // 指定`pid`时，获取`pid`对应的task
-    pid = attr->link_create.uprobe_multi.pid;
     if (pid) {
         rcu_read_lock();
-        task = get_pid_task(find_vpid(pid), PIDTYPE_PID);
+        task = get_pid_task(find_vpid(pid), PIDTYPE_TGID);
         rcu_read_unlock();
         if (!task) { ... }
     }
@@ -429,25 +440,22 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
     uprobes = kvcalloc(cnt, sizeof(*uprobes), GFP_KERNEL);
     if (!uprobes || !link) goto error_free;
 
-    // 复制`ref_ctr_offsets`信息到内核空间
-    if (uref_ctr_offsets) {
-        ref_ctr_offsets = kvcalloc(cnt, sizeof(*ref_ctr_offsets), GFP_KERNEL);
-        if (!ref_ctr_offsets) goto error_free;
-    }
-
     for (i = 0; i < cnt; i++) {
         // 设置`uprobes[i]`的`cookie`,`offset`等属性
-        if (ucookies && __get_user(uprobes[i].cookie, ucookies + i)) { ...	}
-        if (uref_ctr_offsets && __get_user(ref_ctr_offsets[i], uref_ctr_offsets + i)) { ...	}
-        if (__get_user(uprobes[i].offset, uoffsets + i)) { ...	}
+        if (__get_user(uprobes[i].offset, uoffsets + i)) { ... }
+        if (uprobes[i].offset < 0) { ... }
+        if (uref_ctr_offsets && __get_user(uprobes[i].ref_ctr_offset, uref_ctr_offsets + i)) { ... }
+        if (ucookies && __get_user(uprobes[i].cookie, ucookies + i)) { ... }
         // 设置`link`
         uprobes[i].link = link;
 
         // 设置`uprobes[i]`的`handler`,`filter`等处理接口
-        if (flags & BPF_F_UPROBE_MULTI_RETURN)
-            uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
-        else
+        if (!(flags & BPF_F_UPROBE_MULTI_RETURN))
             uprobes[i].consumer.handler = uprobe_multi_link_handler;
+        if (flags & BPF_F_UPROBE_MULTI_RETURN || is_uprobe_session(prog))
+            uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
+        if (is_uprobe_session(prog))
+            uprobes[i].session = true;
         if (pid)
             uprobes[i].consumer.filter = uprobe_multi_link_filter;
     }
@@ -456,29 +464,33 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
     link->uprobes = uprobes;
     link->path = path;
     link->task = task;
+    link->flags = flags;
 
     bpf_link_init(&link->link, BPF_LINK_TYPE_UPROBE_MULTI, &bpf_uprobe_multi_link_lops, prog);
 
     for (i = 0; i < cnt; i++) {
         // 逐个注册`uprobe`
-        err = uprobe_register_refctr(d_real_inode(link->path.dentry), uprobes[i].offset,
-                            ref_ctr_offsets ? ref_ctr_offsets[i] : 0, &uprobes[i].consumer);
-        if (err) {
-            bpf_uprobe_unregister(&path, uprobes, i);
-            goto error_free;
+        uprobes[i].uprobe = uprobe_register(d_real_inode(link->path.dentry), uprobes[i].offset,
+                            ref_ctr_offsets[i], &uprobes[i].consumer);
+        // 注册失败时，释放之前注册的`uprobe`            
+        if (IS_ERR(uprobes[i].uprobe)) {
+            err = PTR_ERR(uprobes[i].uprobe);
+            link->cnt = i;
+            goto error_unregister;
         }
     }
 
     // 提供用户空间使用的 fd, id，anon_inode 信息
     err = bpf_link_prime(&link->link, &link_primer);
-    if (err) goto error_free;
+    if (err) goto error_unregister;
 
-    kvfree(ref_ctr_offsets);
     // fd 和 file 进行关联
     return bpf_link_settle(&link_primer);
+
     // 失败时的清理
+error_unregister:
+    bpf_uprobe_unregister(uprobes, link->cnt);
 error_free:
-    kvfree(ref_ctr_offsets);
     kvfree(uprobes);
     kfree(link);
     if (task) put_task_struct(task);
@@ -488,7 +500,7 @@ error_path_put:
 }
 ```
 
-`uprobe_register_refctr`函数注册`uprobe`，其实现过程参见[UPROBE的内核实现](./07-uprobe.md#1-注册过程)中注册过程章节。
+`uprobe_register`函数注册`uprobe`，其实现过程参见[UPROBE的内核实现](./07-uprobe.md#1-注册过程)中注册过程章节。
 
 ### 4.2 注销BPF程序的过程
 
@@ -516,7 +528,8 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 // file: kernel/trace/bpf_trace.c
 static const struct bpf_link_ops bpf_uprobe_multi_link_lops = {
     .release = bpf_uprobe_multi_link_release,
-    .dealloc = bpf_uprobe_multi_link_dealloc,
+    .dealloc_deferred = bpf_uprobe_multi_link_dealloc,
+    .fill_link_info = bpf_uprobe_multi_link_fill_link_info,
 };
 ```
 
@@ -531,7 +544,10 @@ static void bpf_uprobe_multi_link_release(struct bpf_link *link)
     struct bpf_uprobe_multi_link *umulti_link;
 
     umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
-    bpf_uprobe_unregister(&umulti_link->path, umulti_link->uprobes, umulti_link->cnt);
+    // 注销`uprobes`
+    bpf_uprobe_unregister(umulti_link->uprobes, umulti_link->cnt);
+    if (umulti_link->task) put_task_struct(umulti_link->task);
+    path_put(&umulti_link->path);
 }
 ```
 
@@ -542,9 +558,10 @@ static void bpf_uprobe_multi_link_release(struct bpf_link *link)
 static void bpf_uprobe_unregister(struct path *path, struct bpf_uprobe *uprobes, u32 cnt)
 {
     u32 i;
-    for (i = 0; i < cnt; i++) {
-        uprobe_unregister(d_real_inode(path->dentry), uprobes[i].offset, &uprobes[i].consumer);
-    }
+    for (i = 0; i < cnt; i++) 
+        uprobe_unregister_nosync(uprobes[i].uprobe, &uprobes[i].consumer);
+
+    if (cnt) uprobe_unregister_sync();
 }
 ```
 
@@ -560,10 +577,7 @@ static void bpf_uprobe_multi_link_dealloc(struct bpf_link *link)
 {
     struct bpf_uprobe_multi_link *umulti_link;
     umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
-    // 释放`umulti_link`的`task`,`path`,`uprobes`后，释放`umulti_link`
-    if (umulti_link->task)
-        put_task_struct(umulti_link->task);
-    path_put(&umulti_link->path);
+    // 释放`umulti_link`的`uprobes`后，释放`umulti_link`
     kvfree(umulti_link->uprobes);
     kfree(umulti_link);
 }
@@ -585,48 +599,64 @@ UPROBE通过响应INT3中断的方式实现。具体的实现过程参见[UPROBE
 // file: kernel/events/uprobes.c
 static void handler_chain(struct uprobe *uprobe, struct pt_regs *regs)
 {
+    struct uprobe_task *utask = current->utask;
     ...
-    down_read(&uprobe->register_rwsem);
-    for (uc = uprobe->consumers; uc; uc = uc->next) {
+
+    utask->auprobe = &uprobe->arch;
+    list_for_each_entry_rcu(uc, &uprobe->consumers, cons_node, rcu_read_lock_trace_held()) {
+        bool session = uc->handler && uc->ret_handler;
+        __u64 cookie = 0;
         int rc = 0;
         // 入口点
         if (uc->handler) {
-            rc = uc->handler(uc, regs);
-            WARN(rc & ~UPROBE_HANDLER_MASK, "bad rc=0x%x from %ps()\n", rc, uc->handler);
+            rc = uc->handler(uc, regs, &cookie);
+            WARN(rc < 0 || rc > 2, "bad rc=0x%x from %ps()\n", rc, uc->handler);
         }
-        // uretprobe处理接口
-        if (uc->ret_handler)
-            need_prep = true;
-	    remove &= rc;
-    }
+        remove &= rc == UPROBE_HANDLER_REMOVE;
+        has_consumers = true;
 
-    if (need_prep && !remove)
-        // 在返回位置设置断点
-        prepare_uretprobe(uprobe, regs); /* put bp at return */
+        // 没有设置ret_handler，或者忽略ret_handler时，执行下一个
+        if (!uc->ret_handler || ignore_ret_handler(rc)) continue;
 
-    if (remove && uprobe->consumers) {
-        WARN_ON(!uprobe_is_active(uprobe));
-        // 删除断点
-        unapply_uprobe(uprobe, current->mm);
+        // 设置了ret_handler，设置返回位置的断点
+        if (!ri) ri = alloc_return_instance(utask);
+        // 共享session时，设置consumer
+        if (session) ri = push_consumer(ri, uc->id, cookie);
     }
-    up_read(&uprobe->register_rwsem);
+    utask->auprobe = NULL;
+
+    // 在返回位置设置断点
+    if (!ZERO_OR_NULL_PTR(ri)) prepare_uretprobe(uprobe, regs, ri);
+
+    if (remove && has_consumers) {
+        down_read(&uprobe->register_rwsem);
+        // 检查是否需要删除
+        if (!filter_chain(uprobe, current->mm)) {
+            WARN_ON(!uprobe_is_active(uprobe));
+            // 删除断点
+            unapply_uprobe(uprobe, current->mm);
+        }
+        up_read(&uprobe->register_rwsem);
+    }
 }
 ```
 
-`uprobe_multi`类型的程序不能同时`uprobe.multi`和`uretprobe.multi`，即，不能同时设置`handler`和`ret_handler`，如下：
+`uprobe_multi`类型的程序不能同时`uprobe.multi`和`uretprobe.multi`，即，不能同时设置`handler`和`ret_handler`. `uprobe.session`类型的程序可以支持同时设置`handler`和`ret_handler`，如下：
 
 ```C
 // file: kernel/trace/bpf_trace.c
 int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
     ...
-	for (i = 0; i < cnt; i++) {
+    for (i = 0; i < cnt; i++) {
         ...
-        if (flags & BPF_F_UPROBE_MULTI_RETURN)
-            uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
-        else
+        // 设置`uprobes[i]`的`handler`,`filter`等处理接口
+        if (!(flags & BPF_F_UPROBE_MULTI_RETURN))
             uprobes[i].consumer.handler = uprobe_multi_link_handler;
-
+        if (flags & BPF_F_UPROBE_MULTI_RETURN || is_uprobe_session(prog))
+            uprobes[i].consumer.ret_handler = uprobe_multi_link_ret_handler;
+        if (is_uprobe_session(prog))
+            uprobes[i].session = true;
         if (pid)
             uprobes[i].consumer.filter = uprobe_multi_link_filter;
     }
@@ -651,12 +681,15 @@ uprobe_multi_link_filter(struct uprobe_consumer *con, enum uprobe_filter_ctx ctx
 
 ```C
 // file: kernel/trace/bpf_trace.c
-static int uprobe_multi_link_handler(struct uprobe_consumer *con, struct pt_regs *regs)
+static int uprobe_multi_link_handler(struct uprobe_consumer *con, struct pt_regs *regs, __u64 *data)
 {
     struct bpf_uprobe *uprobe;
     // 获取`bpf_uprobe`后，运行BPF程序
     uprobe = container_of(con, struct bpf_uprobe, consumer);
-    return uprobe_prog_run(uprobe, instruction_pointer(regs), regs);
+    ret = uprobe_prog_run(uprobe, instruction_pointer(regs), regs, false, data);
+    // 共享session时，返回`UPROBE_HANDLER_IGNORE`
+    if (uprobe->session) return ret ? UPROBE_HANDLER_IGNORE : 0;
+    return 0;
 }
 ```
 
@@ -664,11 +697,15 @@ static int uprobe_multi_link_handler(struct uprobe_consumer *con, struct pt_regs
 
 ```C
 // file: kernel/trace/bpf_trace.c
-static int uprobe_prog_run(struct bpf_uprobe *uprobe, unsigned long entry_ip, struct pt_regs *regs)
+static int uprobe_prog_run(struct bpf_uprobe *uprobe, unsigned long entry_ip, struct pt_regs *regs, bool is_return, void *data)
 {
     struct bpf_uprobe_multi_link *link = uprobe->link;
     // `uprobe_multi`运行上下文
     struct bpf_uprobe_multi_run_ctx run_ctx = {
+        .session_ctx = {
+            .is_return = is_return,
+            .data = data,
+        },
         .entry_ip = entry_ip,
         .uprobe = uprobe,
     };
@@ -677,8 +714,8 @@ static int uprobe_prog_run(struct bpf_uprobe *uprobe, unsigned long entry_ip, st
     struct bpf_run_ctx *old_run_ctx;
     int err = 0;
 
-    // 不是当前运行的任务，返回
-    if (link->task && current != link->task) return 0;
+    // 不在同一个线程组时，返回
+    if (link->task && !same_thread_group(current, link->task)) return 0;
 
     if (sleepable)
         rcu_read_lock_trace();
@@ -687,7 +724,7 @@ static int uprobe_prog_run(struct bpf_uprobe *uprobe, unsigned long entry_ip, st
     migrate_disable();
 
     // 设置运行上下文
-    old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
+    old_run_ctx = bpf_set_run_ctx(&run_ctx.session_ctx.run_ctx);
     // 运行BPF程序
     err = bpf_prog_run(link->link.prog, regs);
     bpf_reset_run_ctx(old_run_ctx);
@@ -709,17 +746,22 @@ URETPROBE通过设置trampoline的方式实现。具体的实现过程参见[UPR
 
 ```C
 // file: kernel/events/uprobes.c
-static void handle_uretprobe_chain(struct return_instance *ri, struct pt_regs *regs)
+static void handle_uretprobe_chain(struct return_instance *ri, struct uprobe *uprobe, struct pt_regs *regs)
 {
-    struct uprobe *uprobe = ri->uprobe;
+    struct return_consumer *ric;
     struct uprobe_consumer *uc;
+    int ric_idx = 0;
 
-    down_read(&uprobe->register_rwsem);
-    for (uc = uprobe->consumers; uc; uc = uc->next) {
-        if (uc->ret_handler)
-            uc->ret_handler(uc, ri->func, regs);
+    rcu_read_lock_trace();
+    list_for_each_entry_rcu(uc, &uprobe->consumers, cons_node, rcu_read_lock_trace_held()) {
+        bool session = uc->handler && uc->ret_handler;
+        if (uc->ret_handler) {
+            ric = return_consumer_find(ri, &ric_idx, uc->id);
+            if (!session || ric)
+                uc->ret_handler(uc, ri->func, regs, ric ? &ric->cookie : NULL);
+        }
     }
-    up_read(&uprobe->register_rwsem);
+    rcu_read_unlock_trace();
 }
 ```
 
@@ -728,12 +770,13 @@ static void handle_uretprobe_chain(struct return_instance *ri, struct pt_regs *r
 ```C
 // file: kernel/trace/bpf_trace.c
 static int
-uprobe_multi_link_ret_handler(struct uprobe_consumer *con, unsigned long func, struct pt_regs *regs)
+uprobe_multi_link_ret_handler(struct uprobe_consumer *con, unsigned long func, struct pt_regs *regs, __u64 *data)
 {
     struct bpf_uprobe *uprobe;
     // 获取`bpf_uprobe`后，运行BPF程序
     uprobe = container_of(con, struct bpf_uprobe, consumer);
-    return uprobe_prog_run(uprobe, func, regs);
+    uprobe_prog_run(uprobe, func, regs, true, data);
+    return 0;
 }
 ```
 
@@ -749,8 +792,10 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog, struct bpf_prog_lo
 {
     ...
     // USDT在内核支持`UPROBE_MULTI`时，修改附加类型
-    if ((def & SEC_USDT) && kernel_supports(prog->obj, FEAT_UPROBE_MULTI_LINK))
+    if ((def & SEC_USDT) && kernel_supports(prog->obj, FEAT_UPROBE_MULTI_LINK)){
         prog->expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+        opts->expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+    }
     ...
 }
 ```
@@ -865,7 +910,9 @@ static int bpf_link_usdt_detach(struct bpf_link *link)
 
 ## 5 总结
 
-本文通过`uprobe_multi`示例程序分析了`u[ret]probe.multi`的内核实现过程。
+本文通过`uprobe_multi`示例程序分析了`u[ret]probe.multi`和`uprobe.session`的内核实现过程。
+
+`uprobe.session` 支持在同同一个BPF程序在`uprobe` 和 `uretprobe`时同时执行, 通过 `bpf_session_is_return()` kfunc 判断是否在函数返回时执行。
 
 `u[ret]probe.multi` 支持在单个系统调用中附加多个uprobe，提升了附加多个uprobes的速度。`u[ret]probe.multi` 通过Link的方式实现多个`uprobe`。
 
@@ -873,3 +920,4 @@ static int bpf_link_usdt_detach(struct bpf_link *link)
 
 * [uprobe multi link](http://vger.kernel.org/bpfconf2023_material/uprobe_multi.pdf)
 * [bpf: Add multi uprobe link](https://lwn.net/Articles/939802/)
+* [bpf: Add uprobe session support](https://lwn.net/Articles/997510/)
