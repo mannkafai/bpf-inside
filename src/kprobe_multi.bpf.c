@@ -27,3 +27,12 @@ int BPF_KRETPROBE(do_unlinkat_exit, long ret)
 	return 0;
 }
 
+SEC("kprobe.session/do_unlinkat")
+int BPF_KPROBE(session_unlinkat, int dfd, struct filename *name)
+{
+	pid_t pid = bpf_get_current_pid_tgid() >> 32;
+	const char *filename = BPF_CORE_READ(name, name);
+	bool is_return = bpf_session_is_return();
+	bpf_printk("KPROBE.SESSION %s pid = %d, filename = %s\n", is_return ? "EXIT" : "ENTRY",  pid, filename);
+	return 0;
+}
