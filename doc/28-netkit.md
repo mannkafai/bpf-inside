@@ -26,8 +26,15 @@ int tc1(struct __sk_buff *skb)
     if (skb->protocol != __bpf_constant_htons(ETH_P_IP)) goto out;
     if (bpf_skb_load_bytes(skb, 0, &eth, sizeof(eth))) goto out;
     seen_eth = eth.h_proto == bpf_htons(ETH_P_IP);
+    seen_host = skb->pkt_type == PACKET_HOST;
+    if (seen_host && set_type) {
+        eth.h_dest[0] = 4;
+        if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0)) goto fail;
+        bpf_skb_change_type(skb, PACKET_MULTICAST);
+    }
 out:
     seen_tc1 = true;
+fail:
     return TCX_NEXT;
 }
 
@@ -72,7 +79,8 @@ static void serial_test_tc_netkit_multi_links_target(int mode, int target)
     struct bpf_link *link;
     int err, ifindex;
     // 创建`netkit`设备
-    err = create_netkit(mode, NETKIT_PASS, NETKIT_PASS, &ifindex, false);
+    err = create_netkit(mode, NETKIT_PASS, NETKIT_PASS, &ifindex, 
+                        ETKIT_SCRUB_DEFAULT, NETKIT_SCRUB_DEFAULT, 0);
     if (err) return;
 
     // 打开BPF程序
@@ -108,7 +116,6 @@ static void serial_test_tc_netkit_multi_links_target(int mode, int target)
     // 附加第二个BPF程序
     link = bpf_program__attach_netkit(skel->progs.tc2, ifindex, &optl);
     if (!ASSERT_OK_PTR(link, "link_attach")) goto cleanup;
-
     skel->links.tc2 = link;
     ...
 
@@ -142,10 +149,16 @@ cleanup:
 ```bash
 $ cd tools/testing/selftests/bpf/
 $ sudo make
-$ sudo ./tc_netkit
+$ sudo test_progs -t tc_netkit
+#423     tc_netkit_basic:OK
+#424     tc_netkit_device:OK
+#425     tc_netkit_multi_links:OK
+#426     tc_netkit_multi_opts:OK
+#427     tc_netkit_neigh_links:OK
+#428     tc_netkit_pkt_type:OK
+#429     tc_netkit_scrub:OK
+Summary: 7/0 PASSED, 0 SKIPPED, 0 FAILED
 ```
-
-由于`netkit`在Linux v6.7内核中添加的，目前使用的是Linux v6.5，因此运行失败。
 
 ## 3 `netkit`附加BPF的过程
 
@@ -172,11 +185,9 @@ static const struct bpf_sec_def section_defs[] = {
 // 本地和对端网卡名称
 #define netkit_peer "nk0"
 #define netkit_name "nk1"
-// 本地和对端IP地址
-#define ping_addr_neigh     0x0a000002 /* 10.0.0.2 */
-#define ping_addr_noneigh   0x0a000003 /* 10.0.0.3 */
 
-static int create_netkit(int mode, int policy, int peer_policy, int *ifindex, bool same_netns)
+static int create_netkit(int mode, int policy, int peer_policy, int *ifindex,
+            int scrub, int peer_scrub, __u32 flags)
 {
     struct rtnl_handle rth = { .fd = -1 };
     struct iplink_req req = {};
@@ -204,7 +215,13 @@ static int create_netkit(int mode, int policy, int peer_policy, int *ifindex, bo
     data = addattr_nest(&req.n, sizeof(req), IFLA_INFO_DATA);
     addattr32(&req.n, sizeof(req), IFLA_NETKIT_POLICY, policy);
     addattr32(&req.n, sizeof(req), IFLA_NETKIT_PEER_POLICY, peer_policy);
+    addattr32(&req.n, sizeof(req), IFLA_NETKIT_SCRUB, scrub);
+    addattr32(&req.n, sizeof(req), IFLA_NETKIT_PEER_SCRUB, peer_scrub);
     addattr32(&req.n, sizeof(req), IFLA_NETKIT_MODE, mode);
+    if (flags & FLAG_ADJUST_ROOM) {
+        addattr16(&req.n, sizeof(req), IFLA_NETKIT_HEADROOM, NETKIT_HEADROOM);
+        addattr16(&req.n, sizeof(req), IFLA_NETKIT_TAILROOM, NETKIT_TAILROOM);
+    }
     addattr_nest_end(&req.n, data);
     addattr_nest_end(&req.n, linkinfo);
     // `netlink`交互
@@ -221,7 +238,13 @@ static int create_netkit(int mode, int policy, int peer_policy, int *ifindex, bo
     // 启用`netkit`网卡(`nk1`)和设置IP地址
     ASSERT_OK(system("ip link set dev " netkit_name " up"), "up primary");
     ASSERT_OK(system("ip addr add dev " netkit_name " 10.0.0.1/24"), "addr primary");
-    if (same_netns) {
+    // 设置`netkit`网卡的MAC地址
+    if (mode == NETKIT_L3) {
+        ASSERT_EQ(system("ip link set dev " netkit_name " addr ee:ff:bb:cc:aa:dd 2> /dev/null"), 512, "set hwaddress");
+    } else {
+        ASSERT_OK(system("ip link set dev " netkit_name " addr ee:ff:bb:cc:aa:dd"), "set hwaddress");
+    }
+    if (flags & FLAG_SAME_NETNS) {
         // 相同命名空间下，启用对端网卡(`nk0`)和设置IP地址
         ASSERT_OK(system("ip link set dev " netkit_peer " up"), "up peer");
         ASSERT_OK(system("ip addr add dev " netkit_peer " 10.0.0.2/24"), "addr peer");
@@ -418,9 +441,12 @@ static int create_netkit(int mode, int policy, int peer_policy, int *ifindex, bo
 void __init rtnetlink_init(void)
 {
     ...
-    rtnl_register(PF_UNSPEC, RTM_NEWLINK, rtnl_newlink, NULL, 0);
-    ...
+    rtnl_register_many(rtnetlink_rtnl_msg_handlers);
 }
+static const struct rtnl_msg_handler rtnetlink_rtnl_msg_handlers[] __initconst = {
+    {.msgtype = RTM_NEWLINK, .doit = rtnl_newlink, .flags = RTNL_FLAG_DOIT_PERNET},
+     ...
+};
 ```
 
 `rtnl_newlink` 函数为 `PF_UNSPEC:RTM_NEWLINK` 设置的处理方式，在分配必要的内存后，调用`__rtnl_newlink`函数。实现如下：
@@ -429,13 +455,102 @@ void __init rtnetlink_init(void)
 // file: net/core/rtnetlink.c
 static int rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh, struct netlink_ext_ack *extack)
 {
+    struct net *tgt_net, *link_net = NULL, *peer_net = NULL;
+    struct nlattr **tb, **linkinfo, **data = NULL;
+    struct rtnl_link_ops *ops = NULL;
     struct rtnl_newlink_tbs *tbs;
+    struct rtnl_nets rtnl_nets;
+    int ops_srcu_index;
     int ret;
+
     // 分配`newlink`需要的内存空间
     tbs = kmalloc(sizeof(*tbs), GFP_KERNEL);
     if (!tbs) return -ENOMEM;
-    // 创建新的网络连接
-    ret = __rtnl_newlink(skb, nlh, tbs, extack);
+
+    tb = tbs->tb;
+    // 解析netlink消息属性
+    ret = nlmsg_parse_deprecated(nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX, ifla_policy, extack);
+    if (ret < 0) goto free;
+
+    // 验证rtnetlink请求不存在多个网络命名空间的情况
+    ret = rtnl_ensure_unique_netns(tb, extack, false);
+    if (ret < 0) goto free;
+
+    linkinfo = tbs->linkinfo;
+    if (tb[IFLA_LINKINFO]) {
+        // 存在linkinfo属性时，解析linkinfo
+        ret = nla_parse_nested_deprecated(linkinfo, IFLA_INFO_MAX, tb[IFLA_LINKINFO], ifla_info_policy, NULL);
+        if (ret < 0) goto free;
+    } else {    
+        memset(linkinfo, 0, sizeof(tbs->linkinfo));
+    }
+
+    if (linkinfo[IFLA_INFO_KIND]) {
+        char kind[MODULE_NAME_LEN];
+        // `INFO_KIND`属性存在的情况下，根据`kind`获取网卡的`.ops`操作接口
+        nla_strscpy(kind, linkinfo[IFLA_INFO_KIND], sizeof(kind));
+        ops = rtnl_link_ops_get(kind, &ops_srcu_index);
+#ifdef CONFIG_MODULES
+    if (!ops) {
+            request_module("rtnl-link-%s", kind);
+            ops = rtnl_link_ops_get(kind, &ops_srcu_index);
+        }
+#endif
+    }
+
+    rtnl_nets_init(&rtnl_nets);
+
+    // `ops`存在的情况下，验证`IFLA_INFO_DATA`
+    if (ops) {
+        ...
+
+        // `IFLA_INFO_DATA`属性存在的情况下，解析`IFLA_INFO_DATA`
+        if (ops->maxtype && linkinfo[IFLA_INFO_DATA]) {
+            ret = nla_parse_nested_deprecated(tbs->attr, ops->maxtype, linkinfo[IFLA_INFO_DATA], ops->policy, extack);
+            if (ret < 0) goto put_ops;
+            data = tbs->attr;
+        }
+        // `validate`函数存在的情况下，调用`validate`函数进行验证
+        if (ops->validate) {
+            ret = ops->validate(tb, data, extack);
+            if (ret < 0) goto put_ops;
+        }
+        // 获取`peer_net`
+        if (ops->peer_type) {
+            peer_net = rtnl_get_peer_net(ops, tb, data, extack);
+            if (IS_ERR(peer_net)) { ret = PTR_ERR(peer_net); goto put_ops; }
+            // `peer_net`存在的情况下，添加到网络命名空间中
+            if (peer_net) rtnl_nets_add(&rtnl_nets, peer_net);
+        }
+    }
+    // 获取目标网络
+    tgt_net = rtnl_link_get_net_capable(skb, sock_net(skb->sk), tb, CAP_NET_ADMIN);
+    if (IS_ERR(tgt_net)) { ret = PTR_ERR(tgt_net); goto put_net; }
+    // 添加`tgt_net`到网络命名空间中
+    rtnl_nets_add(&rtnl_nets, tgt_net);
+
+    // 获取`IFLA_LINK_NETNSID`属性，获取网络命名空间
+    if (tb[IFLA_LINK_NETNSID])if (tb[IFLA_LINK_NETNSID]) {
+        int id = nla_get_s32(tb[IFLA_LINK_NETNSID]);
+
+        link_net = get_net_ns_by_id(tgt_net, id);
+        if (!link_net) { ... }
+        // 添加`link_net`到网络命名空间中
+        rtnl_nets_add(&rtnl_nets, link_net);
+        // 验证`link_net`网络命名空间的权限
+        if (!netlink_ns_capable(skb, link_net->user_ns, CAP_NET_ADMIN)) { ret = -EPERM; goto put_net; }
+    }
+
+    rtnl_nets_lock(&rtnl_nets);
+    // 创建新的网卡
+    ret = __rtnl_newlink(skb, nlh, ops, tgt_net, link_net, peer_net, tbs, data, extack);
+    rtnl_nets_unlock(&rtnl_nets);
+
+put_net:
+    rtnl_nets_destroy(&rtnl_nets);
+put_ops:
+    if (ops) rtnl_link_ops_put(ops, ops_srcu_index);
+free:
     kfree(tbs);
     return ret;
 }
@@ -445,95 +560,53 @@ static int rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh, struct netlin
 
 ```C
 // file: net/core/rtnetlink.c
-static int __rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
-            struct rtnl_newlink_tbs *tbs, struct netlink_ext_ack *extack)
+static int __rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh, const struct rtnl_link_ops *ops,
+            struct net *tgt_net, struct net *link_net, struct net *peer_net,
+            struct rtnl_newlink_tbs *tbs, struct nlattr **data, struct netlink_ext_ack *extack)
 {
-    ...
+    struct nlattr ** const tb = tbs->tb;
     struct net *net = sock_net(skb->sk);
-    const struct rtnl_link_ops *ops;
-    struct nlattr **slave_data;
-    char kind[MODULE_NAME_LEN];
+    struct net *device_net;
     struct net_device *dev;
-    ...
+    struct ifinfomsg *ifm;
+    bool link_specified;
 
-    // 解析netlink消息属性
-    err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy, extack);
-    if (err < 0) return err;
+    // 获取网卡所在的网络命名空间
+    device_net = (nlh->nlmsg_flags & NLM_F_CREATE) && (nlh->nlmsg_flags & NLM_F_EXCL) ?
+            tgt_net : net;
 
-    // 验证rtnetlink请求不存在多个网络命名空间的情况
-    err = rtnl_ensure_unique_netns(tb, extack, false);
-    if (err < 0) return err;
-
-    // 获取设置的网卡设置，通过网络设备索引(ifm->ifi_index)或名称获取
+    // 获取网卡设备
     ifm = nlmsg_data(nlh);
     if (ifm->ifi_index > 0) {
         link_specified = true;
-        dev = __dev_get_by_index(net, ifm->ifi_index);
+        // 根据`ifm->ifi_index`获取网卡设备
+        dev = __dev_get_by_index(device_net, ifm->ifi_index);
     } else if (ifm->ifi_index < 0) {
         NL_SET_ERR_MSG(extack, "ifindex can't be negative");
         return -EINVAL;
     } else if (tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME]) {
         link_specified = true;
-        dev = rtnl_dev_get(net, tb);
+        // 根据`ifm->ifi_name`获取网卡设备
+        dev = rtnl_dev_get(device_net, tb);
     } else {
         link_specified = false;
         dev = NULL;
     }
 
-    master_dev = NULL;
-    m_ops = NULL;
-    if (dev) {
-        master_dev = netdev_master_upper_dev_get(dev);
-        if (master_dev) m_ops = master_dev->rtnl_link_ops;
-    }
-    // 获取`linkinfo`
-    if (tb[IFLA_LINKINFO]) {
-        err = nla_parse_nested_deprecated(linkinfo, IFLA_INFO_MAX, tb[IFLA_LINKINFO],
-                    ifla_info_policy, NULL);
-        if (err < 0) return err;
-    } else
-        memset(linkinfo, 0, sizeof(linkinfo));
+    // 网卡设备存在的情况下，修改网卡信息
+    if (dev) return rtnl_changelink(skb, nlh, ops, dev, tgt_net, tbs, data, extack);
 
-    if (linkinfo[IFLA_INFO_KIND]) {
-        // `INFO_KIND`属性存在的情况下，根据`kind`获取网卡的`.ops`操作接口
-        nla_strscpy(kind, linkinfo[IFLA_INFO_KIND], sizeof(kind));
-        ops = rtnl_link_ops_get(kind);
-    } else {
-        // `INFO_KIND`属性不存在的情况下，网卡的`.ops`操作接口设置为`NULL`
-        kind[0] = '\0';
-        ops = NULL;
+    if (!(nlh->nlmsg_flags & NLM_F_CREATE)) {
+        if (link_specified || !tb[IFLA_GROUP]) return -ENODEV;
+        // 修改网卡信息
+        return rtnl_group_changelink(skb, net, tgt_net, nla_get_u32(tb[IFLA_GROUP]), ifm, extack, tb);
     }
 
-    ...
-    if (dev) {
-        // 网卡设备存在的情况下
-        int status = 0;
-        if (nlh->nlmsg_flags & NLM_F_EXCL) return -EEXIST;
-        if (nlh->nlmsg_flags & NLM_F_REPLACE) return -EOPNOTSUPP;
+    if (tb[IFLA_MAP] || tb[IFLA_PROTINFO]) return -EOPNOTSUPP;
+    if (!ops) { NL_SET_ERR_MSG(extack, "Unknown device type"); return -EOPNOTSUPP; }
 
-        err = validate_linkmsg(dev, tb, extack);
-        if (err < 0) return err;
-        if (linkinfo[IFLA_INFO_DATA]) {
-            if (!ops || ops != dev->rtnl_link_ops || !ops->changelink)
-                return -EOPNOTSUPP;
-            // 获取`INFO_DATA`后，调用`.changelink`接口修改网卡信息
-            err = ops->changelink(dev, tb, data, extack);
-            if (err < 0) return err;
-            status |= DO_SETLINK_NOTIFY;
-        }
-        if (linkinfo[IFLA_INFO_SLAVE_DATA]) {
-            if (!m_ops || !m_ops->slave_changelink) return -EOPNOTSUPP;
-            err = m_ops->slave_changelink(master_dev, dev, tb, slave_data, extack);
-            if (err < 0) return err;
-            status |= DO_SETLINK_NOTIFY;
-        }
-        // 调用`do_setlink`函数，设置网卡信息
-        return do_setlink(skb, dev, ifm, extack, tb, status);
-    }
-
-    ...
     // 创建网卡信息
-    return rtnl_newlink_create(skb, ifm, ops, nlh, tb, data, extack);
+    return rtnl_newlink_create(skb, ifm, ops, tgt_net, link_net, peer_net, nlh, tb, data, extack);
 }
 ```
 
@@ -558,14 +631,19 @@ static const struct rtnl_link_ops *rtnl_link_ops_get(const char *kind)
 
 ```C
 // file: net/core/rtnetlink.c
-static int rtnl_newlink_create(struct sk_buff *skb, struct ifinfomsg *ifm,
-                const struct rtnl_link_ops *ops, const struct nlmsghdr *nlh,
+static int rtnl_newlink_create(struct sk_buff *skb, struct ifinfomsg *ifm, const struct rtnl_link_ops *ops,
+                struct net *tgt_net, struct net *link_net, struct net *peer_net, const struct nlmsghdr *nlh, 
                 struct nlattr **tb, struct nlattr **data, struct netlink_ext_ack *extack)
 {
     unsigned char name_assign_type = NET_NAME_USER;
-    struct net *net = sock_net(skb->sk);
+    struct rtnl_newlink_params params = {
+        .src_net = sock_net(skb->sk),
+        .link_net = link_net,
+        .peer_net = peer_net,
+        .tb = tb,
+        .data = data,
+    };
     u32 portid = NETLINK_CB(skb).portid;
-    struct net *dest_net, *link_net;
     struct net_device *dev;
     char ifname[IFNAMSIZ];
     int err;
@@ -580,9 +658,8 @@ static int rtnl_newlink_create(struct sk_buff *skb, struct ifinfomsg *ifm,
         name_assign_type = NET_NAME_ENUM;
     }
 
-    ...
     // 创建新的网卡
-    dev = rtnl_create_link(link_net ? : dest_net, ifname, name_assign_type, ops, tb, extack);
+    dev = rtnl_create_link(tgt_net, ifname, name_assign_type, ops, tb, extack);
     if (IS_ERR(dev)) { err = PTR_ERR(dev); goto out; }
 
     // 设置网卡索引
@@ -593,26 +670,21 @@ static int rtnl_newlink_create(struct sk_buff *skb, struct ifinfomsg *ifm,
         err = ops->newlink(link_net ? : net, dev, tb, data, extack);
     else
         err = register_netdevice(dev);
-    if (err < 0) {
-        free_netdev(dev);
-        goto out;
-    }
+    if (err < 0) { free_netdev(dev); goto out; }
+    
+    netdev_lock_ops(dev);
     // 配置网卡
     err = rtnl_configure_link(dev, ifm, portid, nlh);
     if (err < 0) goto out_unregister;
-    if (link_net) {
-        err = dev_change_net_namespace(dev, dest_net, ifname);
-        if (err < 0) goto out_unregister;
-    }
     if (tb[IFLA_MASTER]) {
         err = do_set_master(dev, nla_get_u32(tb[IFLA_MASTER]), extack);
         if (err) goto out_unregister;
     }
+    netdev_unlock_ops(dev);
 out:
-    if (link_net) put_net(link_net);
-    put_net(dest_net);
     return err;
 out_unregister:
+    netdev_unlock_ops(dev);
     // 失败时的注销过程
     if (ops->newlink) {
         LIST_HEAD(list_kill); 
@@ -644,7 +716,7 @@ struct net_device *rtnl_create_link(struct net *net, const char *ifname,
     // 获取接收队列数量
     if (tb[IFLA_NUM_RX_QUEUES]) num_rx_queues = nla_get_u32(tb[IFLA_NUM_RX_QUEUES]);
     else if (ops->get_num_rx_queues) num_rx_queues = ops->get_num_rx_queues();
-    // 验证发送
+    // 验证队列数量
     if (num_tx_queues < 1 || num_tx_queues > 4096) { ... }
     if (num_rx_queues < 1 || num_rx_queues > 4096) { ... }
 
@@ -690,30 +762,20 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
         unsigned int txqs, unsigned int rxqs)
 {
     struct net_device *dev;
-    unsigned int alloc_size;
-    struct net_device *p;
+    size_t napi_config_sz;
+    unsigned int maxqs;
 
     BUG_ON(strlen(name) >= sizeof(dev->name));
     // 发送队列、接收队列数量检查
     if (txqs < 1) { ... }
     if (rxqs < 1) { ... }
 
-    // 计算分配的内存空间大小
-    alloc_size = sizeof(struct net_device);
-    if (sizeof_priv) {
-        // 私有数据以32字节对齐
-        alloc_size = ALIGN(alloc_size, NETDEV_ALIGN);
-        alloc_size += sizeof_priv;
-    }
-    // 分配空间以32字节对齐
-    alloc_size += NETDEV_ALIGN - 1;
+    maxqs = max(txqs, rxqs);
+    // 分配`net_device`结构
+    dev = kvzalloc(struct_size(dev, priv, sizeof_priv), GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
+    if (!dev) return NULL;
 
-    // 分配网卡设备需要的内存空间
-    p = kvzalloc(alloc_size, GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
-    if (!p) return NULL;
-
-    dev = PTR_ALIGN(p, NETDEV_ALIGN);
-    dev->padded = (char *)dev - (char *)p;
+    dev->priv_len = sizeof_priv;
     // 初始化网卡计数器追踪器
     ref_tracker_dir_init(&dev->refcnt_tracker, 128, name);
     // 初始化网卡设备的引用计数
@@ -779,6 +841,18 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
     dev->real_num_rx_queues = rxqs;
     if (netif_alloc_rx_queues(dev)) goto free_all;
 
+    // 创建`ethtool`
+    dev->ethtool = kzalloc(sizeof(*dev->ethtool), GFP_KERNEL_ACCOUNT);
+    if (!dev->ethtool) goto free_all;
+    // 创建`cfg`
+    dev->cfg = kzalloc(sizeof(*dev->cfg), GFP_KERNEL_ACCOUNT);
+    if (!dev->cfg) goto free_all;
+    dev->cfg_pending = dev->cfg;
+    // 创建`napi`
+    napi_config_sz = array_size(maxqs, sizeof(*dev->napi_config));
+    dev->napi_config = kvzalloc(napi_config_sz, GFP_KERNEL_ACCOUNT);
+    if (!dev->napi_config) goto free_all;
+
     // 设置网卡名称
     strcpy(dev->name, name);
     dev->name_assign_type = name_assign_type;
@@ -815,12 +889,11 @@ free_dev:
 
 ```C
 // file: net/core/rtnetlink.c
-void __init rtnetlink_init(void)
-{
+static const struct rtnl_msg_handler rtnetlink_rtnl_msg_handlers[] __initconst = {
     ...
-    rtnl_register(PF_UNSPEC, RTM_DELLINK, rtnl_dellink, NULL, 0);
+    {.msgtype = RTM_DELLINK, .doit = rtnl_dellink, .flags = RTNL_FLAG_DOIT_PERNET_WIP},
     ...
-}
+} ;
 ```
 
 `rtnl_dellink` 函数为 `PF_UNSPEC:RTM_DELLINK` 设置的处理方式，在验证用户空间的`netlink`设置后，获取相应的网卡设备后，删除网卡设备。实现如下：
@@ -829,6 +902,7 @@ void __init rtnetlink_init(void)
 // file: net/core/rtnetlink.c
 static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh, struct netlink_ext_ack *extack)
 {
+    struct ifinfomsg *ifm = nlmsg_data(nlh);
     struct net *net = sock_net(skb->sk);
     u32 portid = NETLINK_CB(skb).portid;
     struct net *tgt_net = net;
@@ -842,32 +916,33 @@ static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh, struct netlin
     err = rtnl_ensure_unique_netns(tb, extack, true);
     if (err < 0) return err;
 
-    ...
+    // 获取目标网络命名空间
+    if (tb[IFLA_TARGET_NETNSID]) {
+        netnsid = nla_get_s32(tb[IFLA_TARGET_NETNSID]);
+        tgt_net = rtnl_get_net_ns_capable(NETLINK_CB(skb).sk, netnsid);
+        if (IS_ERR(tgt_net)) return PTR_ERR(tgt_net);
+    }
 
+    rtnl_net_lock(tgt_net);
     // 获取设置的网卡设置，通过网络设备索引(ifm->ifi_index)或名称获取
-    err = -EINVAL;
-    ifm = nlmsg_data(nlh);
     if (ifm->ifi_index > 0)
         dev = __dev_get_by_index(tgt_net, ifm->ifi_index);
     else if (tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME])
         dev = rtnl_dev_get(net, tb);
+    
+    if (dev)
+        // 删除网卡设备
+        err = rtnl_delete_link(dev, portid, nlh);
+    else if (ifm->ifi_index > 0 || tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME])
+        err = -ENODEV;
     else if (tb[IFLA_GROUP])
+        // 从group中删除网卡设备
         err = rtnl_group_dellink(tgt_net, nla_get_u32(tb[IFLA_GROUP]));
     else
-        goto out;
+        err = -EINVAL;
     
-    // 网卡设备不存在时，返回错误
-    if (!dev) {
-        if (tb[IFLA_IFNAME] || tb[IFLA_ALT_IFNAME] || ifm->ifi_index > 0)
-            err = -ENODEV;
-        goto out;
-    }
-    // 删除网卡设备
-    err = rtnl_delete_link(dev, portid, nlh);
-
-out:
-    if (netnsid >= 0)
-        put_net(tgt_net);
+    rtnl_net_unlock(tgt_net);
+    if (netnsid >= 0) put_net(tgt_net);
     return err;
 }
 ```
@@ -912,6 +987,7 @@ static struct rtnl_link_ops netkit_link_ops = {
     .fill_info  = netkit_fill_info,
     .policy     = netkit_policy,
     .validate   = netkit_validate,
+    .peer_type  = IFLA_NETKIT_PEER_INFO,
     .maxtype    = IFLA_NETKIT_MAX,
 };
 ```
@@ -940,34 +1016,30 @@ module_init(netkit_init);
 // file: drivers/net/netkit.c
 int rtnl_link_register(struct rtnl_link_ops *ops)
 {
+    struct rtnl_link_ops *tmp;
     int err;
     // 检查最大的类型，避免栈空间溢出
     if (WARN_ON(ops->maxtype > RTNL_MAX_TYPE ||
             ops->slave_maxtype > RTNL_SLAVE_MAX_TYPE))
         return -EINVAL;
 
-    rtnl_lock();
-    err = __rtnl_link_register(ops);
-    rtnl_unlock();
-    return err;
-}
-```
-
-`__rtnl_link_register`函数注册`rtnl_link_ops`到内核中，实现如下：
-
-```C
-// file: net/core/rtnetlink.c
-int __rtnl_link_register(struct rtnl_link_ops *ops)
-{
-    // 类别存在时，返回错误
-    if (rtnl_link_ops_get(ops->kind)) return -EEXIST;
-
     // 检查必要的`.dellink`接口
     if ((ops->alloc || ops->setup) && !ops->dellink)
         ops->dellink = unregister_netdevice_queue;
+    // 初始化`srcu`(sleep-RCU)结构
+    err = init_srcu_struct(&ops->srcu);
+    if (err) return err;
+    
+    mutex_lock(&link_ops_mutex);
+    list_for_each_entry(tmp, &link_ops, list) {
+        // 检查`ops`是否存在
+        if (!strcmp(ops->kind, tmp->kind)) { err = -EEXIST; goto unlock; }
+    }
     // 添加到`link_ops`列表中
-    list_add_tail(&ops->list, &link_ops);
-    return 0;
+    list_add_tail_rcu(&ops->list, &link_ops);
+unlock:
+    mutex_unlock(&link_ops_mutex);
+    return err;
 }
 ```
 
@@ -991,27 +1063,25 @@ module_exit(netkit_exit);
 // file: net/core/rtnetlink.c
 void rtnl_link_unregister(struct rtnl_link_ops *ops)
 {
+    struct net *net;
+    // 从`link_ops`列表中删除`ops`
+    mutex_lock(&link_ops_mutex);
+    list_del_rcu(&ops->list);
+    mutex_unlock(&link_ops_mutex);
+
+    // 同步`srcu`后，清理
+    synchronize_srcu(&ops->srcu);
+    cleanup_srcu_struct(&ops->srcu);
+
     down_write(&pernet_ops_rwsem);
     rtnl_lock_unregistering_all();
-    __rtnl_link_unregister(ops);
+
+    // 遍历所有的命名空间，删除网络设置
+    for_each_net(net)
+        __rtnl_kill_links(net, ops);
+
     rtnl_unlock();
     up_write(&pernet_ops_rwsem);
-}
-```
-
-`__rtnl_link_unregister`函数注销`rtnl_link_ops`操作接口，实现如下：
-
-```C
-// file: net/core/rtnetlink.c
-void __rtnl_link_unregister(struct rtnl_link_ops *ops)
-{
-    struct net *net;
-    for_each_net(net) {
-        // 遍历所有的命名空间，删除网络设置
-        __rtnl_kill_links(net, ops);
-    }
-    // 从列表中删除`rtnl_link_ops`操作接口
-    list_del(&ops->list);
 }
 ```
 
@@ -1062,6 +1132,8 @@ static void netkit_setup(struct net_device *dev)
     dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
     dev->priv_flags |= IFF_PHONY_HEADROOM;
     dev->priv_flags |= IFF_NO_QUEUE;
+    dev->priv_flags |= IFF_DISABLE_NETPOLL;
+    dev->lltx = true;
     // 网卡`ethtool_ops`和`netdev_ops`接口设置
     dev->ethtool_ops = &netkit_ethtool_ops;
     dev->netdev_ops  = &netkit_netdev_ops;
@@ -1121,9 +1193,12 @@ void netif_set_tso_max_size(struct net_device *dev, unsigned int size)
 
 ```C
 // file: drivers/net/netkit.c
-static int netkit_new_link(struct net *src_net, struct net_device *dev,
-    struct nlattr *tb[], struct nlattr *data[], struct netlink_ext_ack *extack)
+static int netkit_new_link(struct net_device *dev, struct rtnl_newlink_params *params,
+        struct netlink_ext_ack *extack)
 {
+    struct net *peer_net = rtnl_newlink_peer_net(params);
+    enum netkit_scrub scrub_prim = NETKIT_SCRUB_DEFAULT;
+    enum netkit_scrub scrub_peer = NETKIT_SCRUB_DEFAULT;
     // 默认策略和工作模式
     enum netkit_action default_prim = NETKIT_PASS;
     enum netkit_action default_peer = NETKIT_PASS;
@@ -1131,23 +1206,21 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
     struct netkit *nk;
     ...
 
+    tbp = tb;
     if (data) {
         // 用户空间网卡设置
-        if (data[IFLA_NETKIT_MODE]) {
-            attr = data[IFLA_NETKIT_MODE];
-            mode = nla_get_u32(attr);
-            err = netkit_check_mode(mode, attr, extack);
-            if (err < 0) return err;
-        }
+        if (data[IFLA_NETKIT_MODE]) 
+            mode = nla_get_u32(data[IFLA_NETKIT_MODE]);
         if (data[IFLA_NETKIT_PEER_INFO]) {
             attr = data[IFLA_NETKIT_PEER_INFO];
             ifmp = nla_data(attr);
-            err = rtnl_nla_parse_ifinfomsg(peer_tb, attr, extack);
-            if (err < 0) return err;
-            err = netkit_validate(peer_tb, NULL, extack);
-            if (err < 0) return err;
+            rtnl_nla_parse_ifinfomsg(peer_tb, attr, extack);
             tbp = peer_tb;
         }
+        if (data[IFLA_NETKIT_SCRUB])
+            scrub_prim = nla_get_u32(data[IFLA_NETKIT_SCRUB]);
+        if (data[IFLA_NETKIT_PEER_SCRUB])
+            scrub_peer = nla_get_u32(data[IFLA_NETKIT_PEER_SCRUB]);
         if (data[IFLA_NETKIT_POLICY]) {
             attr = data[IFLA_NETKIT_POLICY];
             default_prim = nla_get_u32(attr);
@@ -1160,6 +1233,10 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
             err = netkit_check_policy(default_peer, attr, extack);
             if (err < 0) return err;
         }
+        if (data[IFLA_NETKIT_HEADROOM])
+            headroom = nla_get_u16(data[IFLA_NETKIT_HEADROOM]);
+        if (data[IFLA_NETKIT_TAILROOM])
+            tailroom = nla_get_u16(data[IFLA_NETKIT_TAILROOM]);
     }
 
     // 对端网卡名称设置
@@ -1170,18 +1247,26 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
         strscpy(ifname, "nk%d", IFNAMSIZ);
         ifname_assign_type = NET_NAME_ENUM;
     }
-    // 获取网络命名空间
-    net = rtnl_link_get_net(src_net, tbp);
-    if (IS_ERR(net)) return PTR_ERR(net);
+    // 网卡工作模式检查
+    if (mode != NETKIT_L2 && (tb[IFLA_ADDRESS] || tbp[IFLA_ADDRESS]))
+        return -EOPNOTSUPP;
     // 创建对端网卡
-    peer = rtnl_create_link(net, ifname, ifname_assign_type, 
-                &netkit_link_ops, tbp, extack);
+    peer = rtnl_create_link(peer_net, ifname, ifname_assign_type, &netkit_link_ops, tbp, extack);
     if (IS_ERR(peer)) { ... }
     // 对端网卡TSO设置，继承当前网卡设置
     netif_inherit_tso_max(peer, dev);
+    // header,tail设置
+    if (headroom) {
+        peer->needed_headroom = headroom;
+        dev->needed_headroom = headroom;
+    }
+    if (tailroom) {
+        peer->needed_tailroom = tailroom;
+        dev->needed_tailroom = tailroom;
+    }
 
     // 网卡工作在L2模式下，对端网卡随机化MAC地址
-    if (mode == NETKIT_L2)
+    if (mode == NETKIT_L2 && !(ifmp && tbp[IFLA_ADDRESS]))
         eth_hw_addr_random(peer);
     // 对端网卡索引设置
     if (ifmp && dev->ifindex)
@@ -1189,8 +1274,10 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
     // 对端网卡私有数据设置
     nk = netkit_priv(peer);
     nk->primary = false;
-    nk->policy = default_peer;
+    nk->policy = policy_peer;
+    nk->scrub = scrub_peer;
     nk->mode = mode;
+    nk->headroom = headroom;
     bpf_mprog_bundle_init(&nk->bundle);
     // 注册对端网卡
     err = register_netdevice(peer);
@@ -1205,7 +1292,7 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
     if (err < 0) goto err_configure_peer;
 
     // 网卡工作在L2模式下，本地网卡随机化MAC地址
-    if (mode == NETKIT_L2)
+    if (mode == NETKIT_L2 && !tb[IFLA_ADDRESS])
         eth_hw_addr_random(dev);
     // 本地网卡名称设置
     if (tb[IFLA_IFNAME])
@@ -1215,8 +1302,10 @@ static int netkit_new_link(struct net *src_net, struct net_device *dev,
     // 本地网卡私有数据设置
     nk = netkit_priv(dev);
     nk->primary = true;
-    nk->policy = default_prim;
+    nk->policy = policy_prim;
+    nk->scrub = scrub_prim;
     nk->mode = mode;
+    nk->headroom = headroom;
     bpf_mprog_bundle_init(&nk->bundle);
     // 注册本地网卡
     err = register_netdevice(dev);
@@ -1245,6 +1334,7 @@ struct netkit {
     struct net_device __rcu *peer;
     struct bpf_mprog_entry __rcu *active;
     enum netkit_action policy;
+    enum netkit_scrub scrub;
     struct bpf_mprog_bundle bundle;
 
     enum netkit_mode mode;
@@ -1671,10 +1761,11 @@ static const struct net_device_ops netkit_netdev_ops = {
     .ndo_start_xmit     = netkit_xmit,
     .ndo_set_rx_mode    = netkit_set_multicast,
     .ndo_set_rx_headroom    = netkit_set_headroom,
+    .ndo_set_mac_address    = netkit_set_macaddr,
     .ndo_get_iflink     = netkit_get_iflink,
     .ndo_get_peer_dev   = netkit_peer_dev,
     .ndo_get_stats64    = netkit_get_stats,
-    .ndo_uninit = netkit_uninit,
+    .ndo_uninit         = netkit_uninit,
     .ndo_features_check = passthru_features_check,
 };
 ```
@@ -1685,6 +1776,7 @@ static const struct net_device_ops netkit_netdev_ops = {
 // file: drivers/net/netkit.c
 static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+    struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
     struct netkit *nk = netkit_priv(dev);
     // 默认的过滤结果
     enum netkit_action ret = READ_ONCE(nk->policy);
@@ -1693,14 +1785,18 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
     struct net_device *peer;
     int len = skb->len;
 
+    bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
     rcu_read_lock();
     // 获取对端网卡
     peer = rcu_dereference(nk->peer);
+    // 对端网卡不存在或者未启动时，丢弃skb
     if (unlikely(!peer || !(peer->flags & IFF_UP) ||
             !pskb_may_pull(skb, ETH_HLEN) || skb_orphan_frags(skb, GFP_ATOMIC)))
         goto drop;
     // 设置skb转发
-    netkit_prep_forward(skb, !net_eq(dev_net(dev), dev_net(peer)));
+    netkit_prep_forward(skb, !net_eq(dev_net(dev), dev_net(peer)), nk->scrub);
+    // skb目的地址不匹配时设置协议
+    eth_skb_pkt_type(skb, peer);
     skb->dev = peer;
 
     // 获取`netkit`设置的`mprog`
@@ -1711,7 +1807,7 @@ static netdev_tx_t netkit_xmit(struct sk_buff *skb, struct net_device *dev)
     case NETKIT_NEXT:
     case NETKIT_PASS:
         // `NEXT`和`PASS`时，重新设置skb的协议和更新校验和
-        skb->protocol = eth_type_trans(skb, skb->dev);
+        eth_skb_pull_mac(skb);
         skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
         // 成功添加到接收队列时，更新发送和接收计数
         if (likely(__netif_rx(skb) == NET_RX_SUCCESS)) {
@@ -1738,6 +1834,7 @@ drop_stats:
         break;
     }
     rcu_read_unlock();
+    bpf_net_ctx_clear(bpf_net_ctx);
     return ret_dev;
 }
 ```
