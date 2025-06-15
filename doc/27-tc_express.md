@@ -92,14 +92,20 @@ $ cmake ../src
 $ make tcx 
 $ sudo ./tcx 
 libbpf: loading object 'tcx_bpf' from buffer
-libbpf: elf: section(3) tcx/ingress, size 160, link 0, flags 6, type=1
+libbpf: elf: section(3) tcx/ingress, size 144, link 0, flags 6, type=1
 ...
 libbpf: map 'tcx_bpf.rodata': created successfully, fd=3
-libbpf: prog 'tc_ingress': failed to attach to tcx: Invalid argument
-Failed to attach TC: -22
+Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` to see output of the BPF program.
 ```
 
-由于`tcx`在Linux v6.6内核中添加的，目前使用的是Linux v6.5，因此运行失败。
+在另一个终端中运行，如下：
+
+```bash
+$ $ sudo cat /sys/kernel/debug/tracing/trace_pipe
+ irq/178-rtw89_p-914     [000] ..s2. 561255.862417: bpf_trace_printk: Got IP packet: tot_len: 2908, ttl: 52
+ irq/178-rtw89_p-914     [000] ..s2. 561255.863041: bpf_trace_printk: Got IP packet: tot_len: 1480, ttl: 52
+ ...
+ ```
 
 ## 3 tcx附加BPF的过程
 
@@ -288,7 +294,7 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 
     switch (prog->type) {
     ...
-	case BPF_PROG_TYPE_SCHED_CLS:
+    case BPF_PROG_TYPE_SCHED_CLS:
         if (attr->link_create.attach_type == BPF_TCX_INGRESS ||
             attr->link_create.attach_type == BPF_TCX_EGRESS)
             // `tcx`
@@ -432,7 +438,7 @@ static inline struct bpf_mprog_entry * tcx_entry_fetch(struct net_device *dev, b
 
 ```C
 // file: kernel/bpf/tcx.c
-static inline struct bpf_mprog_entry *tcx_entry_create(void)
+static inline struct bpf_mprog_entry *tcx_entry_create_noprof(void)
 {
     struct tcx_entry *tcx = kzalloc(sizeof(*tcx), GFP_KERNEL);
     if (tcx) {
@@ -442,6 +448,7 @@ static inline struct bpf_mprog_entry *tcx_entry_create(void)
     }
     return NULL;
 }
+#define tcx_entry_create(...)   alloc_hooks(tcx_entry_create_noprof(__VA_ARGS__))
 ```
 
 `bpf_mprog_bundle_init`函数初始化`mprog_bundle`，设置`bundle`的层次关系，如下：
@@ -471,7 +478,7 @@ static inline void bpf_mprog_bundle_init(struct bpf_mprog_bundle *bundle)
 struct tcx_entry {
     struct mini_Qdisc __rcu *miniq;
     struct bpf_mprog_bundle bundle;
-    bool miniq_active;
+    u32 miniq_active;
     struct rcu_head rcu;
 };
 ```
@@ -1064,8 +1071,8 @@ static int clsact_init(struct Qdisc *sch, struct nlattr *opt, truct netlink_ext_
     // 创建`ingress`路径上`mprog`
     entry = tcx_entry_fetch_or_create(dev, true, &created);
     if (!entry) return -ENOMEM;
-    // 标记`mprog`处于启用状态
-    tcx_miniq_set_active(entry, true);
+    // 增加`mprog`启用计数
+    tcx_miniq_inc(entry);
     // miniqp_ingress初始化
     mini_qdisc_pair_init(&q->miniqp_ingress, sch, &tcx_entry(entry)->miniq);
     // 更新网卡设备上`ingress`路径上的`mprog`
@@ -1084,7 +1091,7 @@ static int clsact_init(struct Qdisc *sch, struct nlattr *opt, truct netlink_ext_
     // 创建`egress`路径上`mprog`
     entry = tcx_entry_fetch_or_create(dev, false, &created);
     if (!entry) return -ENOMEM;
-    tcx_miniq_set_active(entry, true);
+    tcx_miniq_inc(entry);
     // miniqp_egress初始化
     mini_qdisc_pair_init(&q->miniqp_egress, sch, &tcx_entry(entry)->miniq);
     // 更新网卡设备上`egress`路径上的`mprog`
@@ -1098,15 +1105,15 @@ static int clsact_init(struct Qdisc *sch, struct nlattr *opt, truct netlink_ext_
 }
 ```
 
-`tcx_miniq_set_active`函数修改`mprog`启用状态，当前设置为启用状态，其实现如下：
+`tcx_miniq_inc`函数修改`mprog`启用状态，增加`miniq`的启用计数，其实现如下：
 
 ```C
 // file: include/net/tcx.h
-static inline void tcx_miniq_set_active(struct bpf_mprog_entry *entry, const bool active)
+static inline void tcx_miniq_inc(struct bpf_mprog_entry *entry)
 {
     ASSERT_RTNL();
     // 设置`miniq_active`启用状态标记
-    tcx_entry(entry)->miniq_active = active;
+    tcx_entry(entry)->miniq_active++;
 }
 ```
 
@@ -1167,10 +1174,13 @@ static inline struct sk_buff * sch_handle_ingress(struct sk_buff *skb, struct pa
     // 获取网卡设备`ingress`路径上的`mprog`
     struct bpf_mprog_entry *entry = rcu_dereference_bh(skb->dev->tcx_ingress);
     enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_INGRESS;
+    struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
     int sch_ret;
 
     // `mprog`不存在时，直接返回`skb`
     if (!entry) return skb;
+    // 设置`net_ctx`
+    bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
     if (*pt_prev) {
         // 传送skb
         *ret = deliver_skb(skb, *pt_prev, orig_dev);
@@ -1199,11 +1209,13 @@ ingress_verdict:
         }
         // 否则返回结果表示正确发送
         *ret = NET_RX_SUCCESS;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     case TC_ACT_SHOT:
         // 丢弃skb，返回结果表示丢弃
         kfree_skb_reason(skb, drop_reason);
         *ret = NET_RX_DROP;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     case TC_ACT_STOLEN:
     case TC_ACT_QUEUED:
@@ -1213,8 +1225,10 @@ ingress_verdict:
         fallthrough;
     case TC_ACT_CONSUMED:
         *ret = NET_RX_SUCCESS;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     }
+    bpf_net_ctx_clear(bpf_net_ctx);
     return skb;
 }
 ```
@@ -1277,11 +1291,18 @@ static int tc_run(struct tcx_entry *entry, struct sk_buff *skb,
             enum skb_drop_reason *drop_reason)
 {
     int ret = TC_ACT_UNSPEC;
+#ifdef CONFIG_NET_CLS_ACT
     // 获取`miniq`
     struct mini_Qdisc *miniq = rcu_dereference_bh(entry->miniq);
     struct tcf_result res;
     // `miniq`不存在时，返回
     if (!miniq) return ret;
+
+    // 系统不进行TC处理时，返回
+    if (!static_branch_likely(&tcf_sw_enabled_key)) return ret;
+
+    // `miniq`的`block`不进行TC处理时，返回
+    if (tcf_block_bypass_sw(miniq->block)) return ret;
 
     // skb->cb 属性设置后，更新流量统计信息
     tc_skb_cb(skb)->mru = 0;
@@ -1303,6 +1324,7 @@ static int tc_run(struct tcx_entry *entry, struct sk_buff *skb,
         skb->tc_index = TC_H_MIN(res.classid);
         break;
     }
+#endif /* CONFIG_NET_CLS_ACT */
     return ret;
 }
 ```
@@ -1319,9 +1341,11 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
     // 获取`egress`路径上的`mprog`
     struct bpf_mprog_entry *entry = rcu_dereference_bh(dev->tcx_egress);
     enum skb_drop_reason drop_reason = SKB_DROP_REASON_TC_EGRESS;
+    struct bpf_net_context __bpf_net_ctx, *bpf_net_ctx;
     int sch_ret;
     // `mprog`不存在时，返回
     if (!entry) return skb;
+    bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 
     if (static_branch_unlikely(&tcx_needed_key)) {
         // 执行`tcx`，判决`skb`
@@ -1336,11 +1360,13 @@ egress_verdict:
         // 重定向skb，返回结果表示正确发送
         skb_do_redirect(skb);
         *ret = NET_XMIT_SUCCESS;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     case TC_ACT_SHOT:
         // 丢弃skb，返回结果表示丢弃
         kfree_skb_reason(skb, drop_reason);
         *ret = NET_XMIT_DROP;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     case TC_ACT_STOLEN:
     case TC_ACT_QUEUED:
@@ -1348,10 +1374,12 @@ egress_verdict:
         // 释放skb，返回结果表示正确发送
         consume_skb(skb);
         fallthrough;
-	case TC_ACT_CONSUMED:
+    case TC_ACT_CONSUMED:
         *ret = NET_XMIT_SUCCESS;
+        bpf_net_ctx_clear(bpf_net_ctx);
         return NULL;
     }
+    bpf_net_ctx_clear(bpf_net_ctx);
     return skb;
 }
 ```
