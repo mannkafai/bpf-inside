@@ -15,7 +15,7 @@
 BPF程序源码参见[bpf_dctcp.c](../src/bpf_dctcp.c)，主要内容如下：
 
 ```C
-struct dctcp {
+struct bpf_dctcp {
     __u32 old_delivered;
     __u32 old_delivered_ce;
     __u32 prior_rcv_nxt;
@@ -25,14 +25,14 @@ struct dctcp {
     __u32 loss_cwnd;
 };
 
-SEC("struct_ops/dctcp_init")
-void BPF_PROG(dctcp_init, struct sock *sk)
+SEC("struct_ops")
+void BPF_PROG(bpf_dctcp_init, struct sock *sk)
 {
     ...
 }
 
-SEC("struct_ops/dctcp_ssthresh")
-__u32 BPF_PROG(dctcp_ssthresh, struct sock *sk)
+SEC("struct_ops")
+__u32 BPF_PROG(bpf_dctcp_ssthresh, struct sock *sk)
 {
     struct dctcp *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
@@ -40,8 +40,8 @@ __u32 BPF_PROG(dctcp_ssthresh, struct sock *sk)
     return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
 }
 
-SEC("struct_ops/dctcp_cwnd_undo")
-__u32 BPF_PROG(dctcp_cwnd_undo, struct sock *sk)
+SEC("struct_ops")
+__u32 BPF_PROG(bpf_dctcp_cwnd_undo, struct sock *sk)
 {
     const struct dctcp *ca = inet_csk_ca(sk);
     return max(tcp_sk(sk)->snd_cwnd, ca->loss_cwnd);
@@ -49,21 +49,21 @@ __u32 BPF_PROG(dctcp_cwnd_undo, struct sock *sk)
 
 extern void tcp_reno_cong_avoid(struct sock *sk, __u32 ack, __u32 acked) __ksym;
 
-SEC("struct_ops/dctcp_reno_cong_avoid")
-void BPF_PROG(dctcp_cong_avoid, struct sock *sk, __u32 ack, __u32 acked)
+SEC("struct_ops")
+void BPF_PROG(bpf_dctcp_cong_avoid, struct sock *sk, __u32 ack, __u32 acked)
 {
     tcp_reno_cong_avoid(sk, ack, acked);
 }
 
 SEC(".struct_ops")
 struct tcp_congestion_ops dctcp = {
-    .init       = (void *)dctcp_init,
-    .in_ack_event   = (void *)dctcp_update_alpha,
-    .cwnd_event = (void *)dctcp_cwnd_event,
-    .ssthresh   = (void *)dctcp_ssthresh,
-    .cong_avoid = (void *)dctcp_cong_avoid,
-    .undo_cwnd  = (void *)dctcp_cwnd_undo,
-    .set_state  = (void *)dctcp_state,
+    .init       = (void *)bpf_dctcp_init,
+    .in_ack_event   = (void *)bpf_dctcp_update_alpha,
+    .cwnd_event = (void *)bpf_dctcp_cwnd_event,
+    .ssthresh   = (void *)bpf_dctcp_ssthresh,
+    .cong_avoid = (void *)bpf_dctcp_cong_avoid,
+    .undo_cwnd  = (void *)bpf_dctcp_cwnd_undo,
+    .set_state  = (void *)bpf_dctcp_state,
     .flags      = TCP_CONG_NEEDS_ECN,
     .name       = "bpf_dctcp",
 };
@@ -78,52 +78,85 @@ struct tcp_congestion_ops dctcp = {
 ```C
 static void test_dctcp(void)
 {
+    struct cb_opts cb_opts = {
+        .cc = "bpf_dctcp",
+    };
+    struct network_helper_opts opts = {
+        .post_socket_cb = cc_cb,
+        .cb_opts    = &cb_opts,
+    };
+    struct network_helper_opts cli_opts = {
+        .post_socket_cb = stg_post_socket_cb,
+        .cb_opts    = &cb_opts,
+    };
+    int lfd = -1, fd = -1, tmp_stg, err;
     struct bpf_dctcp *dctcp_skel;
     struct bpf_link *link;
+
     // 打开并加载BPF程序
     dctcp_skel = bpf_dctcp__open_and_load();
-    if (CHECK(!dctcp_skel, "bpf_dctcp__open_and_load", "failed\n"))	return;
+    if (!ASSERT_OK_PTR(dctcp_skel, "bpf_dctcp__open_and_load")) return;
     // 附加`struct_ops`
     link = bpf_map__attach_struct_ops(dctcp_skel->maps.dctcp);
-    ...
-    // 进行测试
-    do_test("bpf_dctcp", dctcp_skel->maps.sk_stg_map);
-    ...
+    if (!ASSERT_OK_PTR(link, "bpf_map__attach_struct_ops")) {
+        bpf_dctcp__destroy(dctcp_skel);
+        return;
+    }
+
+    cb_opts.map_fd = bpf_map__fd(dctcp_skel->maps.sk_stg_map);
+    // 测试
+    if (!start_test(NULL, &opts, &cli_opts, &lfd, &fd)) goto done;
+
+    err = bpf_map_lookup_elem(cb_opts.map_fd, &fd, &tmp_stg);
+    if (!ASSERT_ERR(err, "bpf_map_lookup_elem(sk_stg_map)") ||
+            !ASSERT_EQ(errno, ENOENT, "bpf_map_lookup_elem(sk_stg_map)"))
+        goto done;
+    // 发送数据
+    ASSERT_OK(send_recv_data(lfd, fd, total_bytes), "send_recv_data");
+    ASSERT_EQ(dctcp_skel->bss->stg_result, expected_stg, "stg_result");
+
+done:
     // 销毁link和BPF程序
     bpf_link__destroy(link);
     bpf_dctcp__destroy(dctcp_skel);
+    if (lfd != -1) close(lfd);
+    if (fd != -1) close(fd);
 }
-
-static void do_test(const char *tcp_ca, const struct bpf_map *sk_stg_map)
+// 测试函数
+static bool start_test(char *addr_str,
+                const struct network_helper_opts *srv_opts,
+                const struct network_helper_opts *cli_opts,
+                int *srv_fd, int *cli_fd)
 {
-    struct sockaddr_in6 sa6 = {};
-    ...
-    WRITE_ONCE(stop, 0);
-    // 创建server和client的socket
-    lfd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (CHECK(lfd == -1, "socket", "errno:%d\n", errno)) return;
-    fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (CHECK(fd == -1, "socket", "errno:%d\n", errno)) { close(lfd); return; }
-    
-    // 设置tcp_ca，TCP拥塞控制算法
-    if (settcpca(lfd, tcp_ca) || settcpca(fd, tcp_ca) ||
-        settimeo(lfd, 0) || settimeo(fd, 0))
-        goto done;
+    // 启动server
+    *srv_fd = start_server_str(AF_INET6, SOCK_STREAM, addr_str, 0, srv_opts);
+    if (!ASSERT_NEQ(*srv_fd, -1, "start_server_str")) goto err;
 
-    ...
-    ...
+    // 连接server
+    *cli_fd = connect_to_fd_opts(*srv_fd, cli_opts);
+    if (!ASSERT_NEQ(*cli_fd, -1, "connect_to_fd_opts")) goto err;
 
-done:
-    close(lfd);
-    close(fd);
+    return true;
+
+err:
+    // 错误时的清理
+    if (*srv_fd != -1) { close(*srv_fd); *srv_fd = -1; }
+    if (*cli_fd != -1) { close(*cli_fd); *cli_fd = -1; }
+    return false;
 }
-
+// 设置TCP拥塞控制算法
+static int cc_cb(int fd, void *opts)
+{
+    struct cb_opts *cb_opts = (struct cb_opts *)opts;
+    return settcpca(fd, cb_opts->cc);
+}
+// 设置TCP拥塞控制算法
 static int settcpca(int fd, const char *tcp_ca)
 {
     int err;
     // 设置TCP拥塞控制算法
     err = setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, tcp_ca, strlen(tcp_ca));
-    if (CHECK(err == -1, "setsockopt(fd, TCP_CONGESTION)", "errno:%d\n", errno))
+    if (!ASSERT_NEQ(err, -1, "setsockopt"))
         return -1;
     return 0;
 }
@@ -195,11 +228,49 @@ struct_ops BPF程序都不支持自动附加，需要手动附加。
 // file: libbpf/src/libbpf.c
 static int bpf_object_init_struct_ops(struct bpf_object *obj)
 {
-    int err;
-    err = init_struct_ops_maps(obj, STRUCT_OPS_SEC, obj->efile.st_ops_shndx, obj->efile.st_ops_data, 0);
-    err = err ?: init_struct_ops_maps(obj, STRUCT_OPS_LINK_SEC, obj->efile.st_ops_link_shndx,
-                        obj->efile.st_ops_link_data, BPF_F_LINK);
-    return err;
+    const char *sec_name;
+    int sec_idx, err;
+    // 遍历所有的`sec`
+    for (sec_idx = 0; sec_idx < obj->efile.sec_cnt; ++sec_idx) {
+        struct elf_sec_desc *desc = &obj->efile.secs[sec_idx];
+        // 跳过非`struct_ops`的`sec`
+        if (desc->sec_type != SEC_ST_OPS) continue;
+
+        sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+        if (!sec_name) return -LIBBPF_ERRNO__FORMAT;
+        // 初始化`struct_ops`
+        err = init_struct_ops_maps(obj, sec_name, sec_idx, desc->data);
+        if (err) return err;
+    }
+    return 0;
+}
+```
+
+`SEC_ST_OPS` 表示`struct_ops`类型的`sec`，在`bpf_object__elf_collect`中确定的，如下：
+
+```C
+// file: libbpf/src/libbpf.c
+static int bpf_object__elf_collect(struct bpf_object *obj)
+{
+    ...
+    scn = NULL;
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        ...
+        else if (sh->sh_type == SHT_PROGBITS && data->d_size > 0) {
+            ...
+            // 确定`sec`类型为`SEC_ST_OPS`
+            else if (strcmp(name, STRUCT_OPS_SEC) == 0 ||
+                    strcmp(name, STRUCT_OPS_LINK_SEC) == 0 ||
+                    strcmp(name, "?" STRUCT_OPS_SEC) == 0 ||
+                    strcmp(name, "?" STRUCT_OPS_LINK_SEC) == 0) {
+                sec_desc->sec_type = SEC_ST_OPS;
+                sec_desc->shdr = sh;
+                sec_desc->data = data;
+                obj->efile.has_st_ops = true;
+            }
+            ...
+        }
+    }
 }
 ```
 
@@ -216,7 +287,7 @@ static int bpf_object_init_struct_ops(struct bpf_object *obj)
 ```C
 // file: libbpf/src/libbpf.c
 static int init_struct_ops_maps(struct bpf_object *obj, const char *sec_name,
-                        int shndx, Elf_Data *data, __u32 map_flags)
+                        int shndx, Elf_Data *data)
 {
     const struct btf_type *type, *datasec;
     const struct btf_var_secinfo *vsi;
@@ -252,12 +323,20 @@ static int init_struct_ops_maps(struct bpf_object *obj, const char *sec_name,
         map->sec_offset = vsi->offset;
         map->name = strdup(var_name);
         if (!map->name) return -ENOMEM;
+        map->btf_value_type_id = type_id;
+        // SEC("?.struct_ops") 表示不自动创建
+        if (sec_name[0] == '?') {
+            map->autocreate = false;
+            sec_name++;
+        }
         // 设置`map`定义信息
         map->def.type = BPF_MAP_TYPE_STRUCT_OPS;
         map->def.key_size = sizeof(int);
         map->def.value_size = type->size;
         map->def.max_entries = 1;
-        map->def.map_flags = map_flags;
+        map->def.map_flags = strcmp(sec_name, STRUCT_OPS_LINK_SEC) == 0 ? BPF_F_LINK : 0;
+        map->autoattach = true;
+
         // 分配并设置`st_ops`信息
         map->st_ops = calloc(1, sizeof(*map->st_ops));
         if (!map->st_ops) return -ENOMEM;
@@ -269,10 +348,8 @@ static int init_struct_ops_maps(struct bpf_object *obj, const char *sec_name,
         if (!st_ops->data || !st_ops->progs || !st_ops->kern_func_off) return -ENOMEM;
         // 检查`vsi`变量是否超过边界
         if (vsi->offset + type->size > data->d_size) { ... }
-        // 设置`st_ops` 数据、类型属性
+        // 设置`st_ops` 类型属性
         memcpy(st_ops->data, data->d_buf + vsi->offset, type->size);
-        st_ops->tname = tname;
-        st_ops->type = type;
         st_ops->type_id = type_id;
     }
     return 0;
@@ -283,23 +360,27 @@ static int init_struct_ops_maps(struct bpf_object *obj, const char *sec_name,
 
 ```C
 // file: libbpf/src/libbpf.c
-static int bpf_map__init_kern_struct_ops(struct bpf_map *map, 
-            const struct btf *btf, const struct btf *kern_btf)
+static int bpf_map__init_kern_struct_ops(struct bpf_map *map)
 {
     const struct btf_member *member, *kern_member, *kern_data_member;
     const struct btf_type *type, *kern_type, *kern_vtype;
+    struct bpf_object *obj = map->obj;
+    const struct btf *btf = obj->btf;
     struct bpf_struct_ops *st_ops;
     ...
     
     // 获取`.struct_ops`内核中属性
     st_ops = map->st_ops;
-    type = st_ops->type;
-    tname = st_ops->tname;
-    err = find_struct_ops_kern_types(kern_btf, tname, &kern_type, &kern_type_id,
-                    &kern_vtype, &kern_vtype_id, &kern_data_member);
+    type = btf__type_by_id(btf, st_ops->type_id);
+    tname = btf__name_by_offset(btf, type->name_off);
+    err = find_struct_ops_kern_types(obj, tname, &mod_btf, &kern_type, &kern_type_id, 
+                &kern_vtype, &kern_vtype_id, &kern_data_member);
     if (err) return err;
 
+    // 获取`kern_btf`
+    kern_btf = mod_btf ? mod_btf->btf : obj->btf_vmlinux;
     // 设置`map`定义信息
+    map->mod_btf_fd = mod_btf ? mod_btf->fd : -1;
     map->def.value_size = kern_vtype->size;
     map->btf_vmlinux_value_type_id = kern_vtype_id;
     // 分配`st_ops`内核变量数据
@@ -313,17 +394,28 @@ static int bpf_map__init_kern_struct_ops(struct bpf_map *map,
     member = btf_members(type);
     for (i = 0; i < btf_vlen(type); i++, member++) {
         const struct btf_type *mtype, *kern_mtype;
-        // 从用户空间btf中获取变量名称，从内核btf中获取内核字段
+        ...
+        // 从用户空间btf中获取变量名称, 计算偏移位置
         mname = btf__name_by_offset(btf, member->name_off);
+        moff = member->offset / 8;
+        mdata = data + moff;
+        msize = btf__resolve_size(btf, member->type);
+        // 检查用户空间字段大小是否异常
+        if (msize < 0) { ... }
+        
+        // 从内核btf中获取内核字段
         kern_member = find_member_by_name(kern_btf, kern_type, mname);
         if (!kern_member) { ... }
 
         kern_member_idx = kern_member - btf_members(kern_type);
-        ...
-        // 计算用户字段和内核字段的位置
-        moff = member->offset / 8;
+        // 检查用户空间和内核空间字段是否是位域, `struct_ops`不支持位域
+        if (btf_member_bitfield_size(type, i) ||
+            btf_member_bitfield_size(kern_type, kern_member_idx)) {
+            pr_warn("struct_ops init_kern %s: bitfield %s is not supported\n", map->name, mname);
+            return -ENOTSUP;
+        }
+        // 计算内核字段的偏移位置
         kern_moff = kern_member->offset / 8;
-        mdata = data + moff;
         kern_mdata = kern_data + kern_moff;
 
         // 检查用户空间和内核空间变量的类型是否匹配
@@ -332,24 +424,33 @@ static int bpf_map__init_kern_struct_ops(struct bpf_map *map,
         if (BTF_INFO_KIND(mtype->info) != BTF_INFO_KIND(kern_mtype->info)) { ... }
         // 该字段是指针，表示是函数
         if (btf_is_ptr(mtype)) {
-            struct bpf_program *prog;
             // 获取BPF程序，在重定位阶段获取的
-            prog = st_ops->progs[i];
+            prog = *(void **)mdata;
+            // 用户替换了BPF程序或者置空，设置`autoload`为`false`
+            if (st_ops->progs[i] && st_ops->progs[i] != prog)
+                st_ops->progs[i]->autoload = false;
+            // 设置`st_ops`的BPF程序
+            st_ops->progs[i] = prog;
             if (!prog) continue;
+            // 检查是否是有效的`struct_ops`程序
+            if (!is_valid_st_ops_program(obj, prog)) { ... }
             // 获取内核类型
             kern_mtype = skip_mods_and_typedefs(kern_btf, kern_mtype->type, &kern_mtype_id);
             if (!btf_is_func_proto(kern_mtype)) { ... }
+
+            if (mod_btf) prog->attach_btf_obj_fd = mod_btf->fd;
             // 设置bpf程序btf_id和附加类型
-            prog->attach_btf_id = kern_type_id;
-            prog->expected_attach_type = kern_member_idx;
+            if (!prog->attach_btf_id) {
+                prog->attach_btf_id = kern_type_id;
+                prog->expected_attach_type = kern_member_idx;
+            }
             // 设置`st_ops`内核函数的偏移位置
             st_ops->kern_func_off[i] = kern_data_off + kern_moff;
             continue;
         }
         // 检查用户空间和内核空间变量的大小是否匹配
-        msize = btf__resolve_size(btf, mtype_id);
         kern_msize = btf__resolve_size(kern_btf, kern_mtype_id);
-        if (msize < 0 || kern_msize < 0 || msize != kern_msize) { ... }
+        if (kern_msize < 0 || msize != kern_msize) { ... }
         // 复制用户空间设置的值到内核空间
         memcpy(kern_mdata, mdata, msize);
     }
@@ -369,7 +470,8 @@ struct bpf_link *bpf_map__attach_struct_ops(const struct bpf_map *map)
     __u32 zero = 0;
     int err, fd;
     // 不是`struct_ops`或已经附加，返回错误
-    if (!bpf_map__is_struct_ops(map) || map->fd == -1) return libbpf_err_ptr(-EINVAL);
+    if (!bpf_map__is_struct_ops(map)) { ... }
+    if (map->fd < 0) { ... }
     // 分配`link`
     link = calloc(1, sizeof(*link));
     if (!link) return libbpf_err_ptr(-EINVAL);
@@ -418,73 +520,81 @@ static int bpf_link__detach_struct_ops(struct bpf_link *link)
 }
 ```
 
+### 3.4  `.struct_ops.link`的管理
+
+`.struct_ops.link`类型时，通过link实现`struct_ops`的注册/注销等管理。如下：
+
+```C
+// file: libbpf/src/libbpf.c
+struct bpf_link *bpf_map__attach_struct_ops(const struct bpf_map *map)
+{
+    ....
+
+    // 设置`LINK`标记，即: `.struct_ops.link` 类型创建内核LINK
+    fd = bpf_link_create(map->fd, 0, BPF_STRUCT_OPS, NULL);
+    if (fd < 0) { ... }
+
+    link->link.fd = fd;
+    link->map_fd = map->fd;
+    return &link->link;
+}
+```
+
+`bpf_link_create`在设置和检查`bpf_attr`属性后，使用`BPF_LINK_CREATE`指令进行BPF系统调用。如下：
+
+```C
+// file: libbpf/src/bpf.c
+int bpf_link_create(int prog_fd, int target_fd, enum bpf_attach_type attach_type,
+            const struct bpf_link_create_opts *opts)
+{
+    const size_t attr_sz = offsetofend(union bpf_attr, link_create);
+    __u32 target_btf_id, iter_info_len;
+    union bpf_attr attr;
+
+    ...
+    iter_info_len = OPTS_GET(opts, iter_info_len, 0);
+    target_btf_id = OPTS_GET(opts, target_btf_id, 0);
+
+    // 检查字段的设置情况，不能同时有效
+    if (iter_info_len || target_btf_id) { ... }
+
+    // attr属性设置
+    memset(&attr, 0, attr_sz);
+    attr.link_create.prog_fd = prog_fd;
+    attr.link_create.target_fd = target_fd;
+    attr.link_create.attach_type = attach_type;
+    attr.link_create.flags = OPTS_GET(opts, flags, 0);
+
+    // 设置了`btf_id`，直接进行处理
+    if (target_btf_id) {
+        attr.link_create.target_btf_id = target_btf_id;
+        goto proceed;
+    }
+    // 根据附加类型设置opts属性
+    switch (attach_type) {
+    ...
+    default:
+        if (!OPTS_ZEROED(opts, flags)) return libbpf_err(-EINVAL);
+        break;
+    }
+proceed:
+    // BPF系统调用，使用`BPF_LINK_CREATE`指令
+    fd = sys_bpf_fd(BPF_LINK_CREATE, &attr, attr_sz);
+    // 创建link成功后返回
+    if (fd >= 0) return fd;
+
+    // 出现`EINVAL`错误时，重新尝试
+    err = -errno;
+    if (err != -EINVAL) return libbpf_err(err);
+    ...
+}
+```
+
 ## 4 内核实现
 
 ### 4.1 `struct_ops`的内核实现
 
-#### 1 `struct_ops`的定义
-
-Linux内核(6.2)中实现了两种`struct_ops`, 在 `bpf_struct_ops_types.h` 文件中定义，如下：
-
-```C
-// file: kernel/bpf/bpf_struct_ops_types.h
-#ifdef CONFIG_BPF_JIT
-#ifdef CONFIG_NET
-BPF_STRUCT_OPS_TYPE(bpf_dummy_ops)
-#endif
-#ifdef CONFIG_INET
-#include <net/tcp.h>
-BPF_STRUCT_OPS_TYPE(tcp_congestion_ops)
-#endif
-#endif
-```
-
-通过 `BPF_STRUCT_OPS_TYPE` 宏进行不同的展开。展开过程如下：
-
-##### (1) BTF定义
-
-```C
-// file: kernel/bpf/bpf_struct_ops.c
-#define BPF_STRUCT_OPS_TYPE(_name)                  \
-extern struct bpf_struct_ops bpf_##_name;           \
-                                                    \
-struct bpf_struct_ops_##_name {                     \
-    BPF_STRUCT_OPS_COMMON_VALUE;                    \
-    struct _name data ____cacheline_aligned_in_smp; \
-};
-#include "bpf_struct_ops_types.h"
-#undef BPF_STRUCT_OPS_TYPE
-```
-
-`struct bpf_struct_ops_##_name` 定义了BTF需要的类型定义。`BPF_STRUCT_OPS_COMMON_VALUE` 同样是个宏，定义了`STRUCT_OPS`结构的通用字段，如下：
-
-```C
-// file: kernel/bpf/bpf_struct_ops.c
-#define BPF_STRUCT_OPS_COMMON_VALUE     \
-    refcount_t refcnt;                  \
-    enum bpf_struct_ops_state state
-```
-
-##### (2) `bpf_struct_ops`定义
-
-`bpf_struct_ops` 是同名结构的数组，定义了`struct_ops`的操作接口，如下：
-
-```C
-// file: kernel/bpf/bpf_struct_ops.c
-enum {
-#define BPF_STRUCT_OPS_TYPE(_name) BPF_STRUCT_OPS_TYPE_##_name,
-#include "bpf_struct_ops_types.h"
-#undef BPF_STRUCT_OPS_TYPE
-    __NR_BPF_STRUCT_OPS_TYPE,
-};
-
-static struct bpf_struct_ops * const bpf_struct_ops[] = {
-#define BPF_STRUCT_OPS_TYPE(_name)				\
-    [BPF_STRUCT_OPS_TYPE_##_name] = &bpf_##_name,
-#include "bpf_struct_ops_types.h"
-#undef BPF_STRUCT_OPS_TYPE
-};
-```
+#### 1 `bpf_struct_ops`的定义
 
 `struct bpf_struct_ops`结构定义了`struct_ops`的操作接口，如下：
 
@@ -498,106 +608,208 @@ struct bpf_struct_ops {
                 const struct bpf_prog *prog);
     int (*init_member)(const struct btf_type *t, const struct btf_member *member,
                 void *kdata, const void *udata);
-    int (*reg)(void *kdata);
-    void (*unreg)(void *kdata);
-    const struct btf_type *type;
-    const struct btf_type *value_type;
+    int (*reg)(void *kdata, struct bpf_link *link);
+    void (*unreg)(void *kdata, struct bpf_link *link);
+    int (*update)(void *kdata, void *old_kdata, struct bpf_link *link);
+    int (*validate)(void *kdata);
+    void *cfi_stubs;
+    struct module *owner;
     const char *name;
     struct btf_func_model func_models[BPF_STRUCT_OPS_MAX_NR_MEMBERS];
-    u32 type_id;
-    u32 value_id;
 };
 ```
 
 通过该结构定义可以了解到，`struct_ops` 最多支持64个属性，支持初始化(`.init`)、初始化字段(`.init_member`)、注册(`.reg`)、注销(`.unreg`)等接口。
 
-#### 2 `struct_ops`的初始化过程
+Linux内核V6.9之前只支持几种固定类型`bpf_struct_ops`，如`bpf_dummy_ops`和`tcp_congestion_ops`等，后续版本支持动态注册`bpf_struct_ops`，`register_bpf_struct_ops`函数用于注册`bpf_struct_ops`。
 
-`struct_ops`在获取内核BTF(`btf_vmlinux`)信息的过程中初始化，调用过程如下：
+#### 2 `struct_ops`的注册过程
+
+`register_bpf_struct_ops`函数动态注册`bpf_struct_ops`，以`tcp_congestion_ops`为例，在内核初始化阶段注册，如下：
 
 ```C
-// file: kernel/bpf/verifier.c
-struct btf *bpf_get_btf_vmlinux(void)
+// file:net/ipv4/bpf_tcp_ca.c
+static int __init bpf_tcp_ca_kfunc_init(void)
 {
-    if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
-        mutex_lock(&bpf_verifier_lock);
-        if (!btf_vmlinux) btf_vmlinux = btf_parse_vmlinux();
-        mutex_unlock(&bpf_verifier_lock);
-    }
-    return btf_vmlinux;
+    int ret;
+
+    ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &bpf_tcp_ca_kfunc_set);
+    ret = ret ?: register_bpf_struct_ops(&bpf_tcp_congestion_ops, tcp_congestion_ops);
+
+    return ret;
 }
+late_initcall(bpf_tcp_ca_kfunc_init);
 ```
 
-`btf_parse_vmlinux`函数解析`vmlinux` BTF信息，在解析的过程中初始化`struct_ops`，如下：
+`register_bpf_struct_ops`是个宏定义，如下：
+
+```C
+// file: include/linux/bpf.h
+#define register_bpf_struct_ops(st_ops, type)               \
+    ({                                                      \
+        struct bpf_struct_ops_##type {                      \
+            struct bpf_struct_ops_common_value common;      \
+            struct type data ____cacheline_aligned_in_smp;  \
+        };                                                  \
+        BTF_TYPE_EMIT(struct bpf_struct_ops_##type);        \
+        __register_bpf_struct_ops(st_ops);                  \
+    })
+```
+
+`register_bpf_struct_ops`定义了一个`struct bpf_struct_ops_##type`结构，`BTF_TYPE_EMIT`触发`struct bpf_struct_ops_##type`类型的BTF信息，`__register_bpf_struct_ops`函数实现具体的注册功能，如下：
 
 ```C
 // file: kernel/bpf/btf.c
-struct btf *btf_parse_vmlinux(void)
-    --> bpf_struct_ops_init(btf, log);
+int __register_bpf_struct_ops(struct bpf_struct_ops *st_ops)
+{
+    struct bpf_verifier_log *log;
+    struct btf *btf;
+    int err = 0;
+
+    // 获取BTF
+    btf = btf_get_module_btf(st_ops->owner);
+    if (!btf) return check_btf_kconfigs(st_ops->owner, "struct_ops");
+    if (IS_ERR(btf)) return PTR_ERR(btf);
+    // 分配`log`
+    log = kzalloc(sizeof(*log), GFP_KERNEL | __GFP_NOWARN);
+    if (!log) { err = -ENOMEM; goto errout; }
+
+    log->level = BPF_LOG_KERNEL;
+    // 添加`struct_ops`到BTF
+    err = btf_add_struct_ops(btf, st_ops, log);
+
+errout:
+    kfree(log);
+    btf_put(btf);
+    return err;
+}
 ```
 
-`bpf_struct_ops_init` 函数实现`struct_ops`的初始化，如下：
+`btf_add_struct_ops`函数添加`struct_ops`到BTF，如下：
+
+```C
+// file: kernel/bpf/btf.c
+static int btf_add_struct_ops(struct btf *btf, struct bpf_struct_ops *st_ops,
+            struct bpf_verifier_log *log)
+{
+    struct btf_struct_ops_tab *tab, *new_tab;
+    int i, err;
+
+    tab = btf->struct_ops_tab;
+    if (!tab) {
+        // 初次注册`struct_ops`，分配4个槽位
+        tab = kzalloc(struct_size(tab, ops, 4), GFP_KERNEL);
+        if (!tab) return -ENOMEM;
+        tab->capacity = 4;
+        btf->struct_ops_tab = tab;
+    }
+    // 检查`struct_ops`是否已存在
+    for (i = 0; i < tab->cnt; i++)
+        if (tab->ops[i].st_ops == st_ops) return -EEXIST;
+    
+    if (tab->cnt == tab->capacity) {
+        // 槽位已满，按照2倍扩容
+        new_tab = krealloc(tab, struct_size(tab, ops, tab->capacity * 2), GFP_KERNEL);
+        if (!new_tab) return -ENOMEM;
+        tab = new_tab;
+        tab->capacity *= 2;
+        btf->struct_ops_tab = tab;
+    }
+    // 注册`struct_ops`
+    tab->ops[btf->struct_ops_tab->cnt].st_ops = st_ops;
+    // 初始化`struct_ops`
+    err = bpf_struct_ops_desc_init(&tab->ops[btf->struct_ops_tab->cnt], btf, log);
+    if (err) return err;
+    // 增加`struct_ops`数量，完成实际的注册
+    btf->struct_ops_tab->cnt++;
+    return 0;
+}
+```
+
+`bpf_struct_ops_desc_init` 函数实现`struct_ops`的初始化，如下：
 
 ```C
 // file: kernel/bpf/bpf_struct_ops.c
-void bpf_struct_ops_init(struct btf *btf, struct bpf_verifier_log *log)
+int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
+        struct btf *btf, struct bpf_verifier_log *log)
 {
-    s32 type_id, value_id, module_id;
+    struct bpf_struct_ops *st_ops = st_ops_desc->st_ops;
+    struct bpf_struct_ops_arg_info *arg_info;
     const struct btf_member *member;
-    struct bpf_struct_ops *st_ops;
     const struct btf_type *t;
+    s32 type_id, value_id;
     char value_name[128];
     const char *mname;
-    u32 i, j;
+    int i, err;
 
-    // 确保"struct bpf_struct_ops_##_name"触发BTF类型
-#define BPF_STRUCT_OPS_TYPE(_name) BTF_TYPE_EMIT(struct bpf_struct_ops_##_name);
-#include "bpf_struct_ops_types.h"
-#undef BPF_STRUCT_OPS_TYPE
+    // 检查`st_ops`名称长度，加上前缀不能超过128
+    if (strlen(st_ops->name) + VALUE_PREFIX_LEN >= sizeof(value_name)) { ... }
+    sprintf(value_name, "%s%s", VALUE_PREFIX, st_ops->name);
+    
+    // `st_ops`必须有`cfi_stubs`
+    if (!st_ops->cfi_stubs) { ... }
 
-    // 获取BTF 模块id
-    module_id = btf_find_by_name_kind(btf, "module", BTF_KIND_STRUCT);
-    if (module_id < 0) { ... }
-    module_type = btf_type_by_id(btf, module_id);
+    // 从BTF中获取`st_ops`名称id
+    type_id = btf_find_by_name_kind(btf, st_ops->name, BTF_KIND_STRUCT);
+    if (type_id < 0) { ... }
+    // 从BTF中获取`st_ops`值id
+    value_id = btf_find_by_name_kind(btf, value_name, BTF_KIND_STRUCT);
+    if (value_id < 0) { ... }
+    // 检查`st_ops`值类型是否是有效类型
+    if (!is_valid_value_type(btf, value_id, t, value_name)) return -EINVAL;
 
-    for (i = 0; i < ARRAY_SIZE(bpf_struct_ops); i++) {
-        st_ops = bpf_struct_ops[i];
-        // 获取`st_ops`名称id
-        sprintf(value_name, "%s%s", VALUE_PREFIX, st_ops->name);
-        value_id = btf_find_by_name_kind(btf, value_name, BTF_KIND_STRUCT);
-        if (value_id < 0) { ...	continue; }
-        // 获取`st_ops`类型id
-        type_id = btf_find_by_name_kind(btf, st_ops->name, BTF_KIND_STRUCT);
-        if (type_id < 0) { ...	continue; }
-        // 获取`st_ops`类型，检查字段是否超过限制
-        t = btf_type_by_id(btf, type_id);
-        if (btf_type_vlen(t) > BPF_STRUCT_OPS_MAX_NR_MEMBERS) { ...	continue; }
+    // 分配`arg_info`
+    arg_info = kcalloc(btf_type_vlen(t), sizeof(*arg_info), GFP_KERNEL);
+    if (!arg_info) return -ENOMEM;
 
-        // 初始化`st_ops`类型中的字段
-        for_each_member(j, t, member) {
-            const struct btf_type *func_proto;
-            // 获取字段名称
-            mname = btf_name_by_offset(btf, member->name_off);
-            if (!*mname) { ... }
-            // 检查字段大小
-            if (__btf_member_bitfield_size(t, member)) { ... }
-            // 解析并初始化函数原型
-            func_proto = btf_type_resolve_func_ptr(btf, member->type, NULL);
-            if (func_proto && 
-                btf_distill_func_proto(log, btf, func_proto, mname, &st_ops->func_models[j])) { ... }
+    // 设置描述信息
+    st_ops_desc->arg_info = arg_info;
+    st_ops_desc->type = t;
+    st_ops_desc->type_id = type_id;
+    st_ops_desc->value_id = value_id;
+    st_ops_desc->value_type = btf_type_by_id(btf, value_id);
+
+    // 初始化`st_ops`类型中的字段
+    for_each_member(i, t, member) {
+        const struct btf_type *func_proto, *ret_type;
+        void **stub_func_addr;
+        u32 moff;
+        
+        // 获取字段名称
+        moff = __btf_member_bit_offset(t, member) / 8;
+        mname = btf_name_by_offset(btf, member->name_off);
+        if (!*mname) { ... }
+        // 检查字段是否是位域，不支持位域
+        if (__btf_member_bitfield_size(t, member)) { ... }
+        // 检查字段是否是模块成员
+        if (!st_ops_ids[IDX_MODULE_ID] && is_module_member(btf, member->type)) { ... }
+        // 解析并初始化函数原型
+        func_proto = btf_type_resolve_func_ptr(btf, member->type, NULL);
+        // 函数原型不存在或不支持，跳过该字段
+        if (!func_proto || bpf_struct_ops_supported(st_ops, moff)) continue;
+
+        if (func_proto->type) {
+            // 解析函数返回类型
+            ret_type = btf_type_resolve_ptr(btf, func_proto->type, NULL);
+            // 检查返回类型是否是结构体
+            if (ret_type && !__btf_type_is_struct(ret_type)) { ... }
         }
-        if (j == btf_type_vlen(t)) {
-            // 全部变量都存在时，尝试初始化，失败时设置`st_ops`类型
-            if (st_ops->init(btf)) {
-                ...
-            } else {
-                st_ops->type_id = type_id;
-                st_ops->type = t;
-                st_ops->value_id = value_id;
-                st_ops->value_type = btf_type_by_id(btf, value_id);
-            }
-        }
+        // 解析函数的参数
+        if (btf_distill_func_proto(log, btf, func_proto, mname, &st_ops->func_models[i])) { ... }
+        // 获取桩函数地址
+        stub_func_addr = *(void **)(st_ops->cfi_stubs + moff);
+        // 初始化函数的参数
+        err = prepare_arg_info(btf, st_ops->name, mname, func_proto, stub_func_addr, arg_info + i);
+        if (err) goto errout;
     }
+    // 存在`.init`接口时，进行初始化
+    if (st_ops->init(btf)) { ... }
+    return 0;
+
+errout:
+    // 注册失败时，清理
+    bpf_struct_ops_desc_release(st_ops_desc);
+    return err;
 }
 ```
 
@@ -621,7 +833,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 {
     ...
     switch (cmd) {
-    case BPF_MAP_CREATE: err = map_create(&attr); break;
+    case BPF_MAP_CREATE: map_create(&attr, uattr.is_kernel); break;
     ...
     }
     return err;
@@ -632,7 +844,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 
 ```C
 // file: kernel/bpf/syscall.c
-static int map_create(union bpf_attr *attr)
+static int map_create(union bpf_attr *attr, bool kernel)
 {
     int numa_node = bpf_map_attr_numa_node(attr);
     struct btf_field_offs *foffs;
@@ -642,11 +854,62 @@ static int map_create(union bpf_attr *attr)
 
     // 检查`attr`设置，检查BTF、BLOOM_FILTER、flags、numa_node是否正确设置
     err = CHECK_ATTR(BPF_MAP_CREATE);
+    // 获取`BPF_F_TOKEN_FD`
+    token_flag = attr->map_flags & BPF_F_TOKEN_FD;
+    attr->map_flags &= ~BPF_F_TOKEN_FD;
+
+    // 检查`attr`中`key`和`value`的BTF类型
+    if (attr->btf_vmlinux_value_type_id) {
+        if (attr->map_type != BPF_MAP_TYPE_STRUCT_OPS ||
+            attr->btf_key_type_id || attr->btf_value_type_id)
+            return -EINVAL;
+    } else if (attr->btf_key_type_id && !attr->btf_value_type_id) {
+        return -EINVAL;
+    }
+    // `BLOOM_FILTER`和`ARENA`不支持`extra`字段
+    if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER && 
+        attr->map_type != BPF_MAP_TYPE_ARENA && attr->map_extra != 0)
+        return -EINVAL;
+    
+    // 检查设置的读写标记是否正确
+    f_flags = bpf_get_file_flag(attr->map_flags);
+    if (f_flags < 0) return f_flags;
+
+    // 检查`numa_node`是否有效
+    if (numa_node != NUMA_NO_NODE && ((unsigned int)numa_node >= nr_node_ids || !node_online(numa_node)))
+        return -EINVAL;
+
+    // 检查type是否越界 
+    map_type = attr->map_type;
+    if (type >= ARRAY_SIZE(bpf_map_types)) return ERR_PTR(-EINVAL);
+    type = array_index_nospec(type, ARRAY_SIZE(bpf_map_types));
+    // 获取`map_ops`操作接口
+    ops = bpf_map_types[type];
+    if (!ops) return ERR_PTR(-EINVAL);
+
+    // `.map_alloc_check`接口，分配map前的检查
+    if (ops->map_alloc_check) {
+        err = ops->map_alloc_check(attr);
+        if (err) return ERR_PTR(err);
+    }
+    if (attr->map_ifindex) ops = &bpf_map_offload_ops;
+    // 不支持`.map_mem_usage`接口时，无效
+    if (!ops->map_mem_usage) return -EINVAL;
+    // 设置token时，获取对应的token
+    if (token_flag) { ... }
+
+    err = -EPERM;
+    // 非特权BPF时，检查token是否有效
+    if (sysctl_unprivileged_bpf_disabled && !bpf_token_capable(token, CAP_BPF)) goto put_token;
     ...
 
-    // 获取map类型后初始化map
-    map = find_and_alloc_map(attr);
-    if (IS_ERR(map)) return PTR_ERR(map);
+    // `.map_alloc`接口，分配map
+    map = ops->map_alloc(attr);
+    if (IS_ERR(map)) return map;
+    // map设置
+    map->ops = ops;
+    map->map_type = type;
+
     // 复制名称
     err = bpf_obj_name_cpy(map->name, attr->map_name, sizeof(attr->map_name));
     if (err < 0) goto free_map;
@@ -671,19 +934,17 @@ static int map_create(union bpf_attr *attr)
         map->btf_value_type_id = attr->btf_value_type_id;
         map->btf_vmlinux_value_type_id = attr->btf_vmlinux_value_type_id;
     }
-    // btf解析字段偏移
-    foffs = btf_parse_field_offs(map->record);
-    if (IS_ERR(foffs)) { ... }
-    map->field_offs = foffs;
 
     // LSM安全检查
-    err = security_bpf_map_alloc(map);
-    if (err) goto free_map_field_offs;
+    err = security_bpf_map_create(map, attr, token, kernel);
+    if (err) goto free_map_sec;
     // 分配map id
     err = bpf_map_alloc_id(map);
     if (err) goto free_map_sec;
     // 保存 内存cgroup (`memcg`)
     bpf_map_save_memcg(map);
+    // 释放`token`
+    bpf_token_put(token);
     // map关联file
     err = bpf_map_new_fd(map, f_flags);
     // 关联文件失败时，释放map
@@ -693,47 +954,11 @@ static int map_create(union bpf_attr *attr)
 
 free_map_sec:
     security_bpf_map_free(map);
-free_map_field_offs:
-    kfree(map->field_offs);
 free_map:
-    btf_put(map->btf);
-    map->ops->map_free(map);
+    bpf_map_free(map);
+put_token:
+    bpf_token_put(token);
     return err;
-}
-```
-
-这其中最重要是确定map的类型后初始化，`find_and_alloc_map` 函数完成该项工作，如下：
-
-```C
-// file: kernel/bpf/syscall.c
-static struct bpf_map *find_and_alloc_map(union bpf_attr *attr)
-{
-    const struct bpf_map_ops *ops;
-    u32 type = attr->map_type;
-    struct bpf_map *map;
-    int err;
-    
-    // 检查type是否越界 
-    if (type >= ARRAY_SIZE(bpf_map_types)) return ERR_PTR(-EINVAL);
-    type = array_index_nospec(type, ARRAY_SIZE(bpf_map_types));
-
-    // 获取`map_ops`操作接口
-    ops = bpf_map_types[type];
-    if (!ops) return ERR_PTR(-EINVAL);
-
-    // `.map_alloc_check`接口，分配map前的检查
-    if (ops->map_alloc_check) {
-        err = ops->map_alloc_check(attr);
-        if (err) return ERR_PTR(err);
-    }
-    if (attr->map_ifindex) ops = &bpf_map_offload_ops;
-    // `.map_alloc`接口，分配map
-    map = ops->map_alloc(attr);
-    if (IS_ERR(map)) return map;
-    // map设置
-    map->ops = ops;
-    map->map_type = type;
-    return map;
 }
 ```
 
@@ -781,6 +1006,7 @@ const struct file_operations bpf_map_fops = {
     .write      = bpf_dummy_write,
     .mmap       = bpf_map_mmap,
     .poll       = bpf_map_poll,
+    .get_unmapped_area = bpf_get_unmapped_area,
 };
 ```
 
@@ -807,6 +1033,7 @@ const struct bpf_map_ops bpf_struct_ops_map_ops = {
     .map_delete_elem = bpf_struct_ops_map_delete_elem,
     .map_update_elem = bpf_struct_ops_map_update_elem,
     .map_seq_show_elem = bpf_struct_ops_map_seq_show_elem,
+    .map_mem_usage = bpf_struct_ops_map_mem_usage,
     .map_btf_id = &bpf_struct_ops_map_btf_ids[0],
 };
 ```
@@ -818,14 +1045,14 @@ const struct bpf_map_ops bpf_struct_ops_map_ops = {
 static int bpf_struct_ops_map_alloc_check(union bpf_attr *attr)
 {
     if (attr->key_size != sizeof(unsigned int) || attr->max_entries != 1 ||
-        attr->map_flags || !attr->btf_vmlinux_value_type_id)
+        (attr->map_flags & ~(BPF_F_LINK | BPF_F_VTYPE_BTF_OBJ_FD)) ||
+        !attr->btf_vmlinux_value_type_id)
         return -EINVAL;
     return 0;
 }
 ```
 
-`STRUCT_OPS`类型的map，只能包含一个项、key为4个字节、不设置flags标记、类型必须在内核`btf`中存在。
-
+`STRUCT_OPS`类型的map，只能包含一个项、key为4个字节，支持`BPF_F_LINK`和`BPF_F_VTYPE_BTF_OBJ_FD`标记、类型必须在内核`btf`中存在。
 
 `.map_alloc`接口在创建map时调用，设置为 `bpf_struct_ops_map_alloc`, 实现如下：
 
@@ -839,11 +1066,23 @@ static struct bpf_map *bpf_struct_ops_map_alloc(union bpf_attr *attr)
     const struct btf_type *t, *vt;
     struct bpf_map *map;
     
-    // 权限检查
-    if (!bpf_capable()) return ERR_PTR(-EPERM);
+    if (attr->map_flags & BPF_F_VTYPE_BTF_OBJ_FD) {
+        // 从`module`中获取`btf`
+        btf = btf_get_by_fd(attr->value_type_btf_obj_fd);
+        if (IS_ERR(btf)) return ERR_CAST(btf);
+        if (!btf_is_module(btf)) { btf_put(btf); return ERR_PTR(-EINVAL); }
+        mod = btf_try_get_module(btf);
+        btf_put(btf);
+        if (!mod) return ERR_PTR(-EINVAL);
+    } else {
+        // 从vmlinux中获取`btf`
+        btf = bpf_get_btf_vmlinux();
+        if (IS_ERR(btf)) return ERR_CAST(btf);
+        if (!btf) return ERR_PTR(-ENOTSUPP);
+    }
 
     // 根据`btf_vmlinux_value_type_id`获取`st_ops`
-    st_ops = bpf_struct_ops_find_value(attr->btf_vmlinux_value_type_id);
+    st_ops = bpf_struct_ops_find_value(btf, attr->btf_vmlinux_value_type_id);
     if (!st_ops) return ERR_PTR(-ENOTSUPP);
     
     // 值类型检查
@@ -861,16 +1100,21 @@ static struct bpf_map *bpf_struct_ops_map_alloc(union bpf_attr *attr)
 
     // `st_map`用户空间、links、image内存空间分配
     st_map->uvalue = bpf_map_area_alloc(vt->size, NUMA_NO_NODE);
-    st_map->links = bpf_map_area_alloc(btf_type_vlen(t) * sizeof(struct bpf_links *), NUMA_NO_NODE);
-    st_map->image = bpf_jit_alloc_exec(PAGE_SIZE);
-    if (!st_map->uvalue || !st_map->links || !st_map->image) { ... }
+    st_map->funcs_cnt = count_func_ptrs(btf, t);
+    st_map->links = bpf_map_area_alloc(st_map->funcs_cnt * sizeof(struct bpf_link *), NUMA_NO_NODE);
+    st_map->ksyms = bpf_map_area_alloc(st_map->funcs_cnt * sizeof(struct bpf_ksym *), NUMA_NO_NODE);
+    if (!st_map->uvalue || !st_map->links || !st_map->ksyms) { ... }
 
-    mutex_init(&st_map->lock);
-    set_vm_flush_reset_perms(st_map->image);
+    st_map->btf = btf;
     // map属性设置
     bpf_map_init_from_attr(map, attr);
     
     return map;
+errout_free:
+    __bpf_struct_ops_map_free(map);
+errout:
+    module_put(mod);
+    return ERR_PTR(ret);
 }
 ```
 
@@ -878,15 +1122,21 @@ static struct bpf_map *bpf_struct_ops_map_alloc(union bpf_attr *attr)
 
 ```C
 // file: kernel/bpf/bpf_struct_ops.c
-static const struct bpf_struct_ops * bpf_struct_ops_find_value(u32 value_id)
+const struct bpf_struct_ops_desc *
+bpf_struct_ops_find_value(struct btf *btf, u32 value_id)
 {
+    const struct bpf_struct_ops_desc *st_ops_list;
     unsigned int i;
-    // 没有设置`value`,`btf_vmlinux`不存在时返回空
-    if (!value_id || !btf_vmlinux) return NULL;
-    // 从`bpf_struct_ops`中获取
-    for (i = 0; i < ARRAY_SIZE(bpf_struct_ops); i++) {
-        if (bpf_struct_ops[i]->value_id == value_id) 
-            return bpf_struct_ops[i];
+    u32 cnt;
+
+    if (!value_id) return NULL;
+    if (!btf->struct_ops_tab) return NULL;
+
+    cnt = btf->struct_ops_tab->cnt;
+    st_ops_list = btf->struct_ops_tab->ops;
+    // 遍历所有的`st_ops`，查找`value_id`对应的`st_ops`
+    for (i = 0; i < cnt; i++) {
+        if (st_ops_list[i].value_id == value_id) return &st_ops_list[i];
     }
     return NULL;
 }
@@ -926,14 +1176,13 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 {
     bpfptr_t ukey = make_bpfptr(attr->key, uattr.is_kernel);
     bpfptr_t uvalue = make_bpfptr(attr->value, uattr.is_kernel);
-    int ufd = attr->map_fd;
     ...
     
     // `ATTR`检查
     if (CHECK_ATTR(BPF_MAP_UPDATE_ELEM)) return -EINVAL;
     
     // 根据fd获取map后，进行权限检查
-    f = fdget(ufd);
+    CLASS(fd, f)(attr->map_fd);
     map = __bpf_map_get(f);
     if (IS_ERR(map)) return PTR_ERR(map);
     bpf_map_write_active_inc(map);
@@ -949,7 +1198,7 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
     if (IS_ERR(value)) { err = PTR_ERR(value); goto free_key; }
 
     // bpf_map更新值
-    err = bpf_map_update_value(map, f.file, key, value, attr->flags);
+    err = bpf_map_update_value(map, fd_file(f), key, value, attr->flags);
 
     kvfree(value);
 free_key:
@@ -973,6 +1222,7 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
     if (bpf_map_is_offloaded(map)) {
         return bpf_map_offload_update_elem(map, key, value, flags);
     } else if (map->map_type == BPF_MAP_TYPE_CPUMAP ||
+            map->map_type == BPF_MAP_TYPE_ARENA ||
             map->map_type == BPF_MAP_TYPE_STRUCT_OPS) {
         return map->ops->map_update_elem(map, key, value, flags);
     } 
@@ -991,30 +1241,25 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 static long bpf_struct_ops_map_update_elem(struct bpf_map *map, void *key, void *value, u64 flags)
 {
     struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
-    const struct bpf_struct_ops *st_ops = st_map->st_ops;
+    const struct bpf_struct_ops_desc *st_ops_desc = st_map->st_ops_desc;
+    const struct bpf_struct_ops *st_ops = st_ops_desc->st_ops;
     struct bpf_struct_ops_value *uvalue, *kvalue;
-    const struct btf_member *member;
-    const struct btf_type *t = st_ops->type;
-    struct bpf_tramp_links *tlinks = NULL;
-    void *udata, *kdata;
-    int prog_fd, err = 0;
-    void *image, *image_end;
-    u32 i;
+    ...
 
     // 不支持flags设置
     if (flags) return -EINVAL;
     // key 必须为0
     if (*(u32 *)key != 0) return -E2BIG;
-    // 检查值类型是否是否匹配
-    err = check_zero_holes(st_ops->value_type, value);
+    // 检查值类型是否匹配
+    err = check_zero_holes(st_map->btf, st_ops_desc->value_type, value);
     if (err) return err;
     // 检查类型是否匹配
     uvalue = value;
-    err = check_zero_holes(t, uvalue->data);
+    err = check_zero_holes(st_map->btf, t, uvalue->data);
     if (err) return err;
 
     // 检查是否重复更新
-    if (uvalue->state || refcount_read(&uvalue->refcnt)) return -EINVAL;
+    if (uvalue->common.state || refcount_read(&uvalue->common.refcnt)) return -EINVAL;
     // 分配`tramp_links`内存空间
     tlinks = kcalloc(BPF_TRAMP_MAX, sizeof(*tlinks), GFP_KERNEL);
     if (!tlinks) return -ENOMEM;
@@ -1024,24 +1269,28 @@ static long bpf_struct_ops_map_update_elem(struct bpf_map *map, void *key, void 
 
     mutex_lock(&st_map->lock);
     // 检查kvalue状态
-    if (kvalue->state != BPF_STRUCT_OPS_STATE_INIT) { err = -EBUSY; goto unlock; }
+    if (kvalue->common.state != BPF_STRUCT_OPS_STATE_INIT) { err = -EBUSY; goto unlock; }
 
     // 复制用户空间设置的值
     memcpy(uvalue, value, map->value_size);
 
     udata = &uvalue->data;
     kdata = &kvalue->data;
-    image = st_map->image;
-    image_end = st_map->image + PAGE_SIZE;
-
+    
+    plink = st_map->links;
+    pksym = st_map->ksyms;
+    tname = btf_name_by_offset(st_map->btf, t->name_off);
+    module_type = btf_type_by_id(btf_vmlinux, st_ops_ids[IDX_MODULE_ID]);
     for_each_member(i, t, member) {
         const struct btf_type *mtype, *ptype;
         struct bpf_prog *prog;
         struct bpf_tramp_link *link;
+        struct bpf_ksym *ksym;
         u32 moff;
         // 获取`struct_ops`中字段的偏移量和类型
         moff = __btf_member_bit_offset(t, member) / 8;
-        ptype = btf_type_resolve_ptr(btf_vmlinux, member->type, NULL);
+        mname = btf_name_by_offset(st_map->btf, member->name_off);
+        ptype = btf_type_resolve_ptr(st_map->btf, member->type, NULL);
         if (ptype == module_type) {
             // 类型时module时，设置内核字段
             if (*(void **)(udata + moff)) goto reset_unlock;
@@ -1056,8 +1305,8 @@ static long bpf_struct_ops_map_update_elem(struct bpf_map *map, void *key, void 
         if (!ptype || !btf_type_is_func_proto(ptype)) {
             u32 msize; 
             // 获取变量的大小
-            mtype = btf_type_by_id(btf_vmlinux, member->type);
-            mtype = btf_resolve_size(btf_vmlinux, mtype, &msize);
+            mtype = btf_type_by_id(st_map->btf, member->type);
+            mtype = btf_resolve_size(st_map->btf, mtype, &msize);
             if (IS_ERR(mtype)) { err = PTR_ERR(mtype); goto reset_unlock; }
             // 字段必须设置为0
             if (memchr_inv(udata + moff, 0, msize)) { err = -EINVAL; goto reset_unlock; }
@@ -1071,43 +1320,68 @@ static long bpf_struct_ops_map_update_elem(struct bpf_map *map, void *key, void 
         prog = bpf_prog_get(prog_fd);
         if (IS_ERR(prog)) { err = PTR_ERR(prog); goto reset_unlock; }
         // 检查BPF程序类型、附加的btf_id和附加类型是否匹配
-        if (prog->type != BPF_PROG_TYPE_STRUCT_OPS || 
-            prog->aux->attach_btf_id != st_ops->type_id ||
-            prog->expected_attach_type != i) { ...  }
+        if (prog->type != BPF_PROG_TYPE_STRUCT_OPS ||
+            prog->aux->attach_btf_id != st_ops_desc->type_id ||
+            prog->expected_attach_type != i)  { ...  }
         // 分配并初始化`tramp_link`
         link = kzalloc(sizeof(*link), GFP_USER);
         if (!link) { ... }
         bpf_link_init(&link->link, BPF_LINK_TYPE_STRUCT_OPS, &bpf_struct_ops_link_lops, prog);
-        st_map->links[i] = &link->link;
-        // `stract_ops`字段为BPF程序时，设置为BPF trampoline
-        err = bpf_struct_ops_prepare_trampoline(tlinks, link, &st_ops->func_models[i], image, image_end);
-        if (err < 0) goto reset_unlock;
-        // 计算image位置
-        *(void **)(kdata + moff) = image;
-        image += err;
+        *plink++ = &link->link;
+        // 初始化`ksym`
+        ksym = kzalloc(sizeof(*ksym), GFP_USER);
+        if (!ksym) { ... }
+        *pksym++ = ksym;
 
+        // `stract_ops`字段为BPF程序时，设置为BPF trampoline
+        trampoline_start = image_off;
+        err = bpf_struct_ops_prepare_trampoline(tlinks, link, &st_ops->func_models[i],
+                *(void **)(st_ops->cfi_stubs + moff), &image, &image_off,
+                st_map->image_pages_cnt < MAX_TRAMP_IMAGE_PAGES);
+        if (err < 0) goto reset_unlock;
+        if (cur_image != image) {
+            // 当前页用完了，增加`image`页
+            st_map->image_pages[st_map->image_pages_cnt++] = image;
+            cur_image = image;
+            trampoline_start = 0;
+        }
+        // 设置`trampoline`地址到内核空间
+        *(void **)(kdata + moff) = image + trampoline_start + cfi_get_offset();
         // 设置 prog_id 到用户空间
         *(unsigned long *)(udata + moff) = prog->aux->id;
+        // 初始化`trampoline`的`ksym`
+        bpf_struct_ops_ksym_init(tname, mname, image + trampoline_start,
+                image_off - trampoline_start, ksym);
     }
-    // 增加相关引用计数
-    refcount_set(&kvalue->refcnt, 1);
-    bpf_map_inc(map);
-
-    // 设置`image`可执行后，注册`st_ops`
-    set_memory_rox((long)st_map->image, 1);
-    err = st_ops->reg(kdata);
-    if (likely(!err)) {
-        // 注册成功后，设置为`INUSE`状态
-        smp_store_release(&kvalue->state, BPF_STRUCT_OPS_STATE_INUSE);
+    // 存在`.validate`函数时，验证内核空间数据
+    if (st_ops->validate) { 
+        err = st_ops->validate(kdata);
+        if (err) goto reset_unlock;
+    }
+    // 保护`image`页
+    for (i = 0; i < st_map->image_pages_cnt; i++) {
+        err = arch_protect_bpf_trampoline(st_map->image_pages[i], PAGE_SIZE);
+        if (err) goto reset_unlock;
+    }
+    // 使用`BPF_F_LINK`时，通过`bpf_link`处理注册和注销
+    if (st_map->map.map_flags & BPF_F_LINK) {
+        err = 0;
+        smp_store_release(&kvalue->common.state, BPF_STRUCT_OPS_STATE_READY);
         goto unlock;
     }
-    // 注册失败时，设置`image`内存标记，设置为只能读写
-    set_memory_nx((long)st_map->image, 1);
-    set_memory_rw((long)st_map->image, 1);
-    bpf_map_put(map);
+    // 注册`st_ops`
+    err = st_ops->reg(kdata, NULL);
+    if (likely(!err)) {
+        // 注册成功后，增加计数，设置为`INUSE`状态
+        bpf_map_inc(map);
+        smp_store_release(&kvalue->common.state, BPF_STRUCT_OPS_STATE_INUSE);
+        goto unlock;
+    }
 
 reset_unlock:
-    // 释放`st_map`的BPF程序，清空`st_map`的用户空间、内核空间的值
+    // 释放`st_map`的`ksym`,`image`,`BPF程序`，清空`st_map`的用户空间、内核空间的值
+    bpf_struct_ops_map_free_ksyms(st_map);
+    bpf_struct_ops_map_free_image(st_map);
     bpf_struct_ops_map_put_progs(st_map);
     memset(uvalue, 0, map->value_size);
     memset(kvalue, 0, map->value_size);
@@ -1115,6 +1389,8 @@ unlock:
     // 释放`tlinks`
     kfree(tlinks);
     mutex_unlock(&st_map->lock);
+    // 注册成功时，增加`ksym`
+    if (!err) bpf_struct_ops_map_add_ksyms(st_map);
     return err;
 }
 ```
@@ -1124,16 +1400,40 @@ unlock:
 ```C
 // file: kernel/bpf/bpf_struct_ops.c
 int bpf_struct_ops_prepare_trampoline(struct bpf_tramp_links *tlinks, struct bpf_tramp_link *link,
-                    const struct btf_func_model *model, void *image, void *image_end)
+            const struct btf_func_model *model, void *stub_func, 
+            void **_image, u32 *_image_off, bool allow_alloc)
 {
-    u32 flags;
+    u32 image_off = *_image_off, flags = BPF_TRAMP_F_INDIRECT;
+    void *image = *_image;
+    int size;
     // 设置`FENTRY`
     tlinks[BPF_TRAMP_FENTRY].links[0] = link;
     tlinks[BPF_TRAMP_FENTRY].nr_links = 1;
     // `BPF_TRAMP_F_RET_FENTRY_RET`只能由`bpf_struct_ops`单独使用
     flags = model->ret_size > 0 ? BPF_TRAMP_F_RET_FENTRY_RET : 0;
-    // 生成bpf_trampoline
-    return arch_prepare_bpf_trampoline(NULL, image, image_end, model, flags, tlinks, NULL);
+    // 计算`trampoline`大小
+    size = arch_bpf_trampoline_size(model, flags, tlinks, stub_func);
+    if (size <= 0) return size ? : -EFAULT;
+    // 必要时分配`image`页
+    if (!image || size > PAGE_SIZE - image_off) {
+        if (!allow_alloc) return -E2BIG;
+        // 分配`image`页
+        image = bpf_struct_ops_image_alloc();
+        if (IS_ERR(image)) return PTR_ERR(image);
+        image_off = 0;
+    }
+    // 生成`trampoline`
+    size = arch_prepare_bpf_trampoline(NULL, image + image_off,
+            image + image_off + size, model, flags, tlinks, stub_func);
+    // 失败时的检查，释放刚分配的`image`页
+    if (size <= 0) { 
+        if (image != *_image) bpf_struct_ops_image_free(image);
+        return size ? : -EFAULT;
+    }
+    // 成功时，更新`image`和`image_off`
+    *_image = image;
+    *_image_off = image_off + size;
+    return 0;
 }
 ```
 
@@ -1170,9 +1470,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
 {
     bpfptr_t ukey = make_bpfptr(attr->key, uattr.is_kernel);
-    int ufd = attr->map_fd;
     struct bpf_map *map;
-    struct fd f;
     void *key;
     int err;
 
@@ -1180,7 +1478,7 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
     if (CHECK_ATTR(BPF_MAP_DELETE_ELEM)) return -EINVAL;
 
     // 根据fd获取map后，进行权限检查
-    f = fdget(ufd);
+    CLASS(fd, f)(attr->map_fd);
     map = __bpf_map_get(f);
     if (IS_ERR(map)) return PTR_ERR(map);
     bpf_map_write_active_inc(map);
@@ -1203,12 +1501,11 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
     err = map->ops->map_delete_elem(map, key);
     rcu_read_unlock();
     bpf_enable_instrumentation();
-    maybe_wait_bpf_programs(map);
+    if (!err) maybe_wait_bpf_programs(map);
 out:
     kvfree(key);
 err_put:
     bpf_map_write_active_dec(map);
-    fdput(f);
     return err;
 }
 ```
@@ -1225,13 +1522,16 @@ static long bpf_struct_ops_map_delete_elem(struct bpf_map *map, void *key)
     struct bpf_struct_ops_map *st_map;
     // 获取`st_map`和之前的状态
     st_map = (struct bpf_struct_ops_map *)map;
-    prev_state = cmpxchg(&st_map->kvalue.state, BPF_STRUCT_OPS_STATE_INUSE, BPF_STRUCT_OPS_STATE_TOBEFREE);
+    // `BPF_F_LINK`不能删除
+    if (st_map->map.map_flags & BPF_F_LINK) return -EOPNOTSUPP;
+    // 检查状态
+    prev_state = cmpxchg(&st_map->kvalue.common.state, BPF_STRUCT_OPS_STATE_INUSE, BPF_STRUCT_OPS_STATE_TOBEFREE);
     switch (prev_state) {
     case BPF_STRUCT_OPS_STATE_INUSE:
         // 注销`st_ops`
-        st_map->st_ops->unreg(&st_map->kvalue.data);
-        // 减少kvalue的引用计数
-        if (refcount_dec_and_test(&st_map->kvalue.refcnt)) bpf_map_put(map);
+        st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, NULL);
+        // 释放map
+        bpf_map_put(map);
         return 0;
     case BPF_STRUCT_OPS_STATE_TOBEFREE:
         return -EINPROGRESS;
@@ -1263,6 +1563,7 @@ const struct file_operations bpf_map_fops = {
     .write      = bpf_dummy_write,
     .mmap       = bpf_map_mmap,
     .poll       = bpf_map_poll,
+    .get_unmapped_area = bpf_get_unmapped_area,
 };
 ```
 
@@ -1310,11 +1611,25 @@ void bpf_map_put(struct bpf_map *map)
     if (atomic64_dec_and_test(&map->refcnt)) {
         // 释放id和btf
         bpf_map_free_id(map);
-        btf_put(map->btf);
-        // 设置工作队列后，添加到队列中
-        INIT_WORK(&map->work, bpf_map_free_deferred);
-        queue_work(system_unbound_wq, &map->work);
+        WARN_ON_ONCE(atomic64_read(&map->sleepable_refcnt));
+        if (READ_ONCE(map->free_after_mult_rcu_gp))
+            call_rcu_tasks_trace(&map->rcu, bpf_map_free_mult_rcu_gp);
+        else if (READ_ONCE(map->free_after_rcu_gp))
+            call_rcu(&map->rcu, bpf_map_free_rcu_gp);
+        else
+            bpf_map_free_in_work(map);
     }
+}
+```
+
+`bpf_map_free_in_work`函数在工作队列中释放map，实现如下：
+
+```C
+// file: kernel/bpf/syscall.c
+static void bpf_map_free_in_work(struct bpf_map *map)
+{
+    INIT_WORK(&map->work, bpf_map_free_deferred);
+    queue_work(system_unbound_wq, &map->work);
 }
 ```
 
@@ -1325,20 +1640,33 @@ void bpf_map_put(struct bpf_map *map)
 static void bpf_map_free_deferred(struct work_struct *work)
 {
     struct bpf_map *map = container_of(work, struct bpf_map, work);
-    struct btf_field_offs *foffs = map->field_offs;
-    struct btf_record *rec = map->record;
     // LSM安全检查
     security_bpf_map_free(map);
     bpf_map_release_memcg(map);
-    // `.map_free`接口
-    map->ops->map_free(map);
-    // 延时释放`field_offs`和`btf_record`
-    kfree(foffs);
-    btf_record_free(rec);
+    bpf_map_free(map);
 }
 ```
 
-##### (2) `struct_ops_map`的删除过程
+`bpf_map_free`函数释放map，实现如下：
+
+```C
+// file: kernel/bpf/syscall.c
+static void bpf_map_free(struct bpf_map *map)
+{
+    struct btf_record *rec = map->record;
+    struct btf *btf = map->btf;
+
+    migrate_disable();
+    // `.map_free`接口
+    map->ops->map_free(map);
+    migrate_enable();
+
+    btf_record_free(rec);
+    btf_put(btf);
+}
+```
+
+##### (2) `struct_ops_map`的释放过程
 
 `.map_free`接口释放map时调用，设置为 `bpf_struct_ops_map_free`, 实现如下：
 
@@ -1347,12 +1675,47 @@ static void bpf_map_free_deferred(struct work_struct *work)
 static void bpf_struct_ops_map_free(struct bpf_map *map)
 {
     struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
-    // 释放BPF程序
+    // 是BTF模块，需要释放模块
+    if (btf_is_module(st_map->btf))
+        module_put(st_map->st_ops_desc->st_ops->owner);
+    bpf_struct_ops_map_del_ksyms(st_map);
+    synchronize_rcu_mult(call_rcu, call_rcu_tasks);
+    __bpf_struct_ops_map_free(map);
+}
+```
+
+`bpf_struct_ops_map_del_ksyms` 函数释放`st_map`的ksyms，实现如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static void bpf_struct_ops_map_del_ksyms(struct bpf_struct_ops_map *st_map)
+{
+    u32 i;
+    for (i = 0; i < st_map->funcs_cnt; i++) {
+        if (!st_map->ksyms[i]) break;
+        bpf_image_ksym_del(st_map->ksyms[i]);
+    }
+}
+```
+
+`__bpf_struct_ops_map_free`函数释放`st_map`，实现如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static void __bpf_struct_ops_map_free(struct bpf_map *map)
+{
+    struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
+
+    // 释放`struct_ops`的BPF程序
     if (st_map->links)
         bpf_struct_ops_map_put_progs(st_map);
-    // 释放`links`,`image`,`uvalue`后，释放`st_map`
+    // 释放ksyms
+    if (st_map->ksyms)
+        bpf_struct_ops_map_free_ksyms(st_map);
     bpf_map_area_free(st_map->links);
-    bpf_jit_free_exec(st_map->image);
+    bpf_map_area_free(st_map->ksyms);
+    // 释放image
+    bpf_struct_ops_map_free_image(st_map);
     bpf_map_area_free(st_map->uvalue);
     bpf_map_area_free(st_map);
 }
@@ -1364,15 +1727,12 @@ static void bpf_struct_ops_map_free(struct bpf_map *map)
 // file: kernel/bpf/bpf_struct_ops.c
 static void bpf_struct_ops_map_put_progs(struct bpf_struct_ops_map *st_map)
 {
-    const struct btf_type *t = st_map->st_ops->type;
     u32 i;
-    // 遍历`st_ops`类型的字段
-    for (i = 0; i < btf_type_vlen(t); i++) {
-        // 设置`link`时，释放
-        if (st_map->links[i]) {
-            bpf_link_put(st_map->links[i]);
-            st_map->links[i] = NULL;
-        }
+    for (i = 0; i < st_map->funcs_cnt; i++) {
+        if (!st_map->links[i]) break;
+        // 释放link
+        bpf_link_put(st_map->links[i]);
+        st_map->links[i] = NULL;
     }
 }
 ```
@@ -1403,86 +1763,281 @@ static void bpf_struct_ops_link_dealloc(struct bpf_link *link)
 }
 ```
 
-### 4.3 `bpf_tcp_congestion_ops`的实现
+### 4.3 `.struct_ops.link`的内核实现
+
+#### 1 注册过程
+
+##### (1) BPF系统调用
+
+`BPF_LINK_CREATE` 是BPF系统调用，如下：
+
+```C
+// file: kernel/bpf/syscall.c
+SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+{
+    return __sys_bpf(cmd, USER_BPFPTR(uattr), size);
+}
+
+static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
+{
+    ...
+    switch (cmd) {
+    ...
+    case BPF_LINK_CREATE: err = link_create(&attr, uattr); break;
+    ...
+    }
+    return err;
+}
+```
+
+##### (2) `BPF_LINK_CREATE`
+
+`link_create` 在检查BFP程序类型和attr属性中附加类型匹配后，针对不同程序类型和附加类型进行不同的处理。 `.struct_ops.link` 设置的附加类型为`BPF_STRUCT_OPS`，对应 `bpf_struct_ops_link_create` 处理函数。如下：
+
+```C
+// file: kernel/bpf/syscall.c
+static int link_create(union bpf_attr *attr, bpfptr_t uattr)
+{
+    ...
+    if (attr->link_create.attach_type == BPF_STRUCT_OPS)
+        return bpf_struct_ops_link_create(attr);
+    ...
+}
+```
+
+##### (3) `bpf_struct_ops_link_create`
+
+`bpf_struct_ops_link_create` 函数检查用户输入的参数信息，设置`link`操作接口后，注册`struct_ops`。如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+int bpf_struct_ops_link_create(union bpf_attr *attr)
+{
+    struct bpf_struct_ops_link *link = NULL;
+    struct bpf_link_primer link_primer;
+    struct bpf_struct_ops_map *st_map;
+    struct bpf_map *map;
+    int err;
+
+    // 获取`struct_ops`的map
+    map = bpf_map_get(attr->link_create.map_fd);
+    if (IS_ERR(map)) return PTR_ERR(map);
+
+    st_map = (struct bpf_struct_ops_map *)map;
+    // 检查`struct_ops`的map是否能够注册，
+    // 即:设置了`BPF_F_LINK`标记，状态为`BPF_STRUCT_OPS_STATE_READY`    
+    if (!bpf_struct_ops_valid_to_reg(map)) { err = -EINVAL; goto err_out; }
+    
+    // 创建 link
+    link = kzalloc(sizeof(*link), GFP_USER);
+    if (!link) { err = -ENOMEM; goto err_out; }
+    // 设置`link`属性
+    bpf_link_init(&link->link, BPF_LINK_TYPE_STRUCT_OPS, &bpf_struct_ops_map_lops, NULL);
+    // 提供用户空间使用的 fd, id，anon_inode 信息
+    err = bpf_link_prime(&link->link, &link_primer);
+    if (err) goto err_out;
+    // 初始化wq
+    init_waitqueue_head(&link->wait_hup);
+
+    mutex_lock(&update_mutex);
+    // `struct_ops`的注册操作
+    err = st_map->st_ops_desc->st_ops->reg(st_map->kvalue.data, &link->link);
+    if (err) { ... }
+    RCU_INIT_POINTER(link->map, map);
+    mutex_unlock(&update_mutex);
+
+    // fd 和 file 进行关联
+    return bpf_link_settle(&link_primer);
+err_out:
+    // 失败时的清理
+    bpf_map_put(map);
+    kfree(link);
+    return err;
+}
+```
+
+#### 2 注销BPF程序的过程
+
+##### (1) `bpf_struct_ops_map_lops`接口
+
+在`bpf_struct_ops_link_create`函数附加link过程中，设置了用户空间操作`bpf_link`的文件接口，如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+int bpf_struct_ops_link_create(union bpf_attr *attr)
+{
+    ...
+    // 设置link属性
+    bpf_link_init(&link->link, BPF_LINK_TYPE_STRUCT_OPS, &bpf_struct_ops_map_lops, NULL);
+    ...
+    // 提供用户空间使用的 fd, id，anon_inode 信息
+    err = bpf_link_prime(&link->link, &link_primer);
+    ...
+}
+```
+
+`bpf_struct_ops_map_lops` 是设置的文件操作接口，定义如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static const struct bpf_link_ops bpf_struct_ops_map_lops = {
+    .dealloc = bpf_struct_ops_map_link_dealloc,
+    .detach = bpf_struct_ops_map_link_detach,
+    .show_fdinfo = bpf_struct_ops_map_link_show_fdinfo,
+    .fill_link_info = bpf_struct_ops_map_link_fill_link_info,
+    .update_map = bpf_struct_ops_map_link_update,
+    .poll = bpf_struct_ops_map_link_poll,
+};
+```
+
+##### (2) 分离接口
+
+`.detach`接口分离`bpf_link`关联的程序。`bpf_struct_ops_map_link_detach`分离`link`，如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static int bpf_struct_ops_map_link_detach(struct bpf_link *link)
+{
+    struct bpf_struct_ops_link *st_link = container_of(link, struct bpf_struct_ops_link, link);
+    struct bpf_struct_ops_map *st_map;
+    struct bpf_map *map;
+
+    mutex_lock(&update_mutex);
+
+    map = rcu_dereference_protected(st_link->map, lockdep_is_held(&update_mutex));
+    if (!map) { mutex_unlock(&update_mutex); return 0; }
+    st_map = container_of(map, struct bpf_struct_ops_map, map);
+    // `struct_ops`注销接口
+    st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, link);
+    // 设置`st_link`的`map`为NULL
+    RCU_INIT_POINTER(st_link->map, NULL);
+    bpf_map_put(&st_map->map);
+
+    mutex_unlock(&update_mutex);
+    // 唤醒等待队列
+    wake_up_interruptible_poll(&st_link->wait_hup, EPOLLHUP);
+    return 0;
+}
+```
+
+##### (3) 释放接口
+
+`.dealloc`接口释放`bpf_link`。`bpf_struct_ops_map_link_dealloc`释放`st_link`，如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static void bpf_struct_ops_map_link_dealloc(struct bpf_link *link)
+{
+    struct bpf_struct_ops_link *st_link;
+    struct bpf_struct_ops_map *st_map;
+
+    st_link = container_of(link, struct bpf_struct_ops_link, link);
+    st_map = (struct bpf_struct_ops_map *)rcu_dereference_protected(st_link->map, true);
+    if (st_map) {
+        // `struct_ops`注销接口
+        st_map->st_ops_desc->st_ops->unreg(&st_map->kvalue.data, link);
+        bpf_map_put(&st_map->map);
+    }
+    // 释放`st_link`
+    kfree(st_link);
+}
+```
+
+##### (4) 更新接口
+
+`.update_map`接口修改`bpf_link`关联的`struct_ops`。`bpf_struct_ops_map_link_update`函数实现该功能，如下：
+
+```C
+// file: kernel/bpf/bpf_struct_ops.c
+static int bpf_struct_ops_map_link_update(struct bpf_link *link, struct bpf_map *new_map,
+                struct bpf_map *expected_old_map)
+{
+    struct bpf_struct_ops_map *st_map, *old_st_map;
+    struct bpf_map *old_map;
+    struct bpf_struct_ops_link *st_link;
+    int err;
+
+    st_link = container_of(link, struct bpf_struct_ops_link, link);
+    st_map = container_of(new_map, struct bpf_struct_ops_map, map);
+
+    // 检查`struct_ops`的map是否能够注册
+    if (!bpf_struct_ops_valid_to_reg(new_map)) return -EINVAL;
+    // 检查`struct_ops`的`update`接口是否存在
+    if (!st_map->st_ops_desc->st_ops->update) return -EOPNOTSUPP;
+
+    mutex_lock(&update_mutex);
+
+    // 获取当前`link`关联的`map`
+    old_map = rcu_dereference_protected(st_link->map, lockdep_is_held(&update_mutex));
+    if (!old_map) { err = -ENOLINK; goto err_out; }
+    if (expected_old_map && old_map != expected_old_map) { ... }
+
+    // 获取`old_map`对应的`st_map`
+    old_st_map = container_of(old_map, struct bpf_struct_ops_map, map);
+    if (st_map->st_ops_desc != old_st_map->st_ops_desc) { ... }
+
+    // `update`接口，更新`struct_ops`
+    err = st_map->st_ops_desc->st_ops->update(st_map->kvalue.data, old_st_map->kvalue.data, link);
+    if (err) goto err_out;
+
+    bpf_map_inc(new_map);
+    // 设置`st_link`的`map`为`new_map`
+    rcu_assign_pointer(st_link->map, new_map);
+    bpf_map_put(old_map);
+
+err_out:
+    mutex_unlock(&update_mutex);
+    return err;
+}
+```
+
+### 4.4 `bpf_tcp_congestion_ops`的实现
 
 `struct_ops`的一个典型的用例就是基于BPF实现TCP拥塞控制算法，在内核中定义为`bpf_tcp_congestion_ops`，如下：
 
 ```C
 // file: net/ipv4/bpf_tcp_ca.c
-struct bpf_struct_ops bpf_tcp_congestion_ops = {
+static struct tcp_congestion_ops __bpf_ops_tcp_congestion_ops = {
+    .ssthresh = bpf_tcp_ca_ssthresh,
+    .cong_avoid = bpf_tcp_ca_cong_avoid,
+    .set_state = bpf_tcp_ca_set_state,
+    .cwnd_event = bpf_tcp_ca_cwnd_event,
+    .in_ack_event = bpf_tcp_ca_in_ack_event,
+    .pkts_acked = bpf_tcp_ca_pkts_acked,
+    .min_tso_segs = bpf_tcp_ca_min_tso_segs,
+    .cong_control = bpf_tcp_ca_cong_control,
+    .undo_cwnd = bpf_tcp_ca_undo_cwnd,
+    .sndbuf_expand = bpf_tcp_ca_sndbuf_expand,
+
+    .init = __bpf_tcp_ca_init,
+    .release = __bpf_tcp_ca_release,
+};
+static struct bpf_struct_ops bpf_tcp_congestion_ops = {
     .verifier_ops = &bpf_tcp_ca_verifier_ops,
     .reg = bpf_tcp_ca_reg,
     .unreg = bpf_tcp_ca_unreg,
-    .check_member = bpf_tcp_ca_check_member,
+    .update = bpf_tcp_ca_update,
     .init_member = bpf_tcp_ca_init_member,
     .init = bpf_tcp_ca_init,
+    .validate = bpf_tcp_ca_validate,
     .name = "tcp_congestion_ops",
+    .cfi_stubs = &__bpf_ops_tcp_congestion_ops,
+    .owner = THIS_MODULE,
 };
 ```
 
 接下来我们逐一分析。
 
-#### 1 检查字段的过程
+#### 1 初始化接口
 
-`.check_member`接口在加载阶段检查`struct_ops`字段时调用，检查是否支持指定的字段。实现如下：
-
-```C
-// file: net/ipv4/bpf_tcp_ca.c
-static int bpf_tcp_ca_check_member(const struct btf_type *t, 
-            const struct btf_member *member, const struct bpf_prog *prog)
-{
-    if (is_unsupported(__btf_member_bit_offset(t, member) / 8))
-        return -ENOTSUPP;
-    return 0;
-}
-```
-
-`is_unsupported` 函数根据字段偏移位置判读是否支持该字段，如下：
-
-```C
-// file: net/ipv4/bpf_tcp_ca.c
-static bool is_unsupported(u32 member_offset)
-{
-    unsigned int i;
-    for (i = 0; i < ARRAY_SIZE(unsupported_ops); i++) {
-        if (member_offset == unsupported_ops[i]) 
-            return true;
-    }
-    return false;
-}
-```
-
-`unsupported_ops`数组表示不支持的字段，定义如下：
-
-```C
-// file: net/ipv4/bpf_tcp_ca.c
-static u32 unsupported_ops[] = {
-    offsetof(struct tcp_congestion_ops, get_info),
-};
-```
-
-即：不支持`get_info`字段。
-
-`bpf_tcp_ca_verifier_ops`结构在加载阶段验证`struct_ops`，定义如下：
-
-```C
-// file: net/ipv4/bpf_tcp_ca.c
-static const struct bpf_verifier_ops bpf_tcp_ca_verifier_ops = {
-    .get_func_proto     = bpf_tcp_ca_get_func_proto,
-    .is_valid_access    = bpf_tcp_ca_is_valid_access,
-    .btf_struct_access  = bpf_tcp_ca_btf_struct_access,
-};
-```
-
-#### 2 初始化过程
-
-`.init`在初始化`struct_ops`时调用，设置为`bpf_tcp_ca_init`，实现如下：
+`.init`在注册`struct_ops`时调用，设置为`bpf_tcp_ca_init`，实现如下：
 
 ```C
 // file: net/ipv4/bpf_tcp_ca.c
 static int bpf_tcp_ca_init(struct btf *btf)
 {
     s32 type_id;
+
     // 获取`sock`的btf类型
     type_id = btf_find_by_name_kind(btf, "sock", BTF_KIND_STRUCT);
     if (type_id < 0) return -EINVAL;
@@ -1493,11 +2048,17 @@ static int bpf_tcp_ca_init(struct btf *btf)
     if (type_id < 0) return -EINVAL;
     tcp_sock_id = type_id;
     tcp_sock_type = btf_type_by_id(btf, tcp_sock_id);
+
+    // 获取`tcp_congestion_ops`的btf类型
+    type_id = btf_find_by_name_kind(btf, "tcp_congestion_ops", BTF_KIND_STRUCT);
+    if (type_id < 0) return -EINVAL;
+    tcp_congestion_ops_type = btf_type_by_id(btf, type_id);
+
     return 0;
 }
 ```
 
-#### 3 初始化字段的过程
+#### 2 初始化字段的过程
 
 `.init_member`接口在附加`struct_ops`时调用，设置`bpf_tcp_ca_init_member`, 支持`flags`和`name`字段的设置。实现如下：
 
@@ -1509,6 +2070,7 @@ static int bpf_tcp_ca_init_member(const struct btf_type *t,
     const struct tcp_congestion_ops *utcp_ca;
     struct tcp_congestion_ops *tcp_ca;
     u32 moff;
+
     // 将udata,kdata分别转换为`utcp_ca`,`tcp_ca`
     utcp_ca = (const struct tcp_congestion_ops *)udata;
     tcp_ca = (struct tcp_congestion_ops *)kdata;
@@ -1518,29 +2080,26 @@ static int bpf_tcp_ca_init_member(const struct btf_type *t,
     switch (moff) {
     case offsetof(struct tcp_congestion_ops, flags):
         // `flags`字段时，检查后设置
-        if (utcp_ca->flags & ~TCP_CONG_MASK) 
-            return -EINVAL;
+        if (utcp_ca->flags & ~TCP_CONG_MASK) return -EINVAL;
         tcp_ca->flags = utcp_ca->flags;
         return 1;
     case offsetof(struct tcp_congestion_ops, name):
-        // `name`字段，复制后检查是否存在同名的`tcp_ca`
+        // 复制`name`字段到内核空间
         if (bpf_obj_name_cpy(tcp_ca->name, utcp_ca->name, sizeof(tcp_ca->name)) <= 0)
             return -EINVAL;
-        if (tcp_ca_find(utcp_ca->name))
-            return -EEXIST;
         return 1;
     }
     return 0;
 }
 ```
 
-#### 4 注册的过程
+#### 3 注册的过程
 
 `.reg`接口在注册`struct_ops`时调用，设置`bpf_tcp_ca_reg`, 注册`tcp_ca`。实现如下：
 
 ```C
 // file: net/ipv4/bpf_tcp_ca.c
-static int bpf_tcp_ca_reg(void *kdata)
+static int bpf_tcp_ca_reg(void *kdata, struct bpf_link *link)
 {
     return tcp_register_congestion_control(kdata);
 }
@@ -1554,10 +2113,8 @@ int tcp_register_congestion_control(struct tcp_congestion_ops *ca)
 {
     int ret = 0;
     // 所有的`ca`必须实现的接口
-    if (!ca->ssthresh || !ca->undo_cwnd || !(ca->cong_avoid || ca->cong_control)) {
-        pr_err("%s does not implement required ops\n", ca->name);
-        return -EINVAL;
-    }
+    ret = tcp_validate_congestion_control(ca);
+    if (ret) return ret;
     // 计算`key`
     ca->key = jhash(ca->name, sizeof(ca->name), strlen(ca->name));
 
@@ -1576,13 +2133,13 @@ int tcp_register_congestion_control(struct tcp_congestion_ops *ca)
 }
 ```
 
-#### 5 注销的过程
+#### 4 注销的过程
 
 `.unreg`接口在注销`struct_ops`时调用，设置`bpf_tcp_ca_unreg`, 注销`tcp_ca`。实现如下：
 
 ```C
 // file: net/ipv4/bpf_tcp_ca.c
-static void bpf_tcp_ca_unreg(void *kdata)
+static void bpf_tcp_ca_unreg(void *kdata, struct bpf_link *link)
 {
     tcp_unregister_congestion_control(kdata);
 }
@@ -1603,7 +2160,7 @@ void tcp_unregister_congestion_control(struct tcp_congestion_ops *ca)
 }
 ```
 
-#### 6 `bpf_tcp_ca`支持的`kfunc`
+#### 5 `bpf_tcp_ca`支持的`kfunc`
 
 `bpf_tcp_ca_kfunc_set`列表表示`bpf_tcp_ca`支持的`kfunc`，定义如下：
 
@@ -1614,13 +2171,13 @@ static const struct btf_kfunc_id_set bpf_tcp_ca_kfunc_set = {
     .set   = &bpf_tcp_ca_check_kfunc_ids,
 };
 
-BTF_SET8_START(bpf_tcp_ca_check_kfunc_ids)
+BTF_KFUNCS_START(bpf_tcp_ca_check_kfunc_ids)
 BTF_ID_FLAGS(func, tcp_reno_ssthresh)
 BTF_ID_FLAGS(func, tcp_reno_cong_avoid)
 BTF_ID_FLAGS(func, tcp_reno_undo_cwnd)
 BTF_ID_FLAGS(func, tcp_slow_start)
 BTF_ID_FLAGS(func, tcp_cong_avoid_ai)
-BTF_SET8_END(bpf_tcp_ca_check_kfunc_ids)
+BTF_KFUNCS_END(bpf_tcp_ca_check_kfunc_ids)
 ```
 
 在`initcall`阶段初始化，如下：
@@ -1629,14 +2186,20 @@ BTF_SET8_END(bpf_tcp_ca_check_kfunc_ids)
 // file: net/ipv4/bpf_tcp_ca.c
 static int __init bpf_tcp_ca_kfunc_init(void)
 {
-    return register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &bpf_tcp_ca_kfunc_set);
+    int ret;
+    // 注册`bpf_tcp_ca`支持的`kfunc`
+    ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &bpf_tcp_ca_kfunc_set);
+    // 注册`bpf_tcp_congestion_ops`
+    ret = ret ?: register_bpf_struct_ops(&bpf_tcp_congestion_ops, tcp_congestion_ops);
+
+    return ret;
 }
 late_initcall(bpf_tcp_ca_kfunc_init);
 ```
 
 此外，在`net/ipv4/tcp_cubic.c`，`kernel/bpf/helpers.c`等文件也提供了`BPF_PROG_TYPE_STRUCT_OPS`使用的`kfunc`，这里就不一一介绍了。
 
-### 4.4 `tcp_ca`的设置过程
+### 4.5 `tcp_ca`的设置过程
 
 #### 1 默认拥塞控制设置
 
@@ -1707,6 +2270,7 @@ void tcp_init_sock(struct sock *sk)
 {
     struct inet_connection_sock *icsk = inet_csk(sk);
     struct tcp_sock *tp = tcp_sk(sk);
+    int rto_min_us, rto_max_ms;
 
     tp->out_of_order_queue = RB_ROOT;
     sk->tcp_rtx_queue = RB_ROOT;
@@ -1715,7 +2279,11 @@ void tcp_init_sock(struct sock *sk)
     INIT_LIST_HEAD(&tp->tsorted_sent_queue);
 
     icsk->icsk_rto = TCP_TIMEOUT_INIT;
-    icsk->icsk_rto_min = TCP_RTO_MIN;
+    rto_max_ms = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rto_max_ms);
+    icsk->icsk_rto_max = msecs_to_jiffies(rto_max_ms);
+
+    rto_min_us = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rto_min_us);
+    icsk->icsk_rto_min = usecs_to_jiffies(rto_min_us);
     icsk->icsk_delack_max = TCP_DELACK_MAX;
     tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
     minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
@@ -1743,9 +2311,11 @@ void tcp_init_sock(struct sock *sk)
     // 设置发送缓冲区、接收缓冲区大小
     WRITE_ONCE(sk->sk_sndbuf, READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_wmem[1]));
     WRITE_ONCE(sk->sk_rcvbuf, READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[1]));
+    tcp_scaling_ratio_init(sk);
 
     set_bit(SOCK_SUPPORT_ZC, &sk->sk_socket->flags);
     sk_sockets_allocated_inc(sk);
+    xa_init_flags(&sk->sk_user_frags, XA_FLAGS_ALLOC1);
 }
 ```
 
@@ -1927,8 +2497,9 @@ void tcp_cleanup_congestion_control(struct sock *sk)
 {
     struct inet_connection_sock *icsk = inet_csk(sk);
     // 调用`.release`接口，释放`sk`的拥塞控制
-    if (icsk->icsk_ca_ops->release)
+    if (icsk->icsk_ca_initialized && icsk->icsk_ca_ops->release)
         icsk->icsk_ca_ops->release(sk);
+    icsk->icsk_ca_initialized = 0;
     // 释放拥塞控制算法
     bpf_module_put(icsk->icsk_ca_ops, icsk->icsk_ca_ops->owner);
 }
